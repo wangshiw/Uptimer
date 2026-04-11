@@ -22,7 +22,6 @@ import {
 } from '../public/visibility';
 import {
   applyHomepageCacheHeaders,
-  readHomepageSnapshotArtifact,
   applyStatusCacheHeaders,
   readHomepageSnapshotArtifactJson,
   readHomepageSnapshotJson,
@@ -599,39 +598,21 @@ publicRoutes.get('/homepage', async (c) => {
     return res;
   }
 
-  let historyPreviewsPromise:
-    | Promise<{
-        resolvedIncidentPreview: Awaited<
-          ReturnType<typeof readHomepageHistoryPreviews>
-        >['resolvedIncidentPreview'];
-        maintenanceHistoryPreview: Awaited<
-          ReturnType<typeof readHomepageHistoryPreviews>
-        >['maintenanceHistoryPreview'];
-      }>
-    | null = null;
-  const getHistoryPreviews = () =>
-    (historyPreviewsPromise ??= readHomepageHistoryPreviews(c.env.DB, now).catch((err) => {
-      console.warn('public homepage: preview read failed', err);
-      return {
-        resolvedIncidentPreview: null,
-        maintenanceHistoryPreview: null,
-      };
-    }));
+  const historyPreviewsPromise = readHomepageHistoryPreviews(c.env.DB, now).catch((err) => {
+    console.warn('public homepage: preview read failed', err);
+    return {
+      resolvedIncidentPreview: null,
+      maintenanceHistoryPreview: null,
+    };
+  });
   const statusSnapshot = await readStatusSnapshot(c.env.DB, now);
   if (statusSnapshot) {
     const payload = homepageFromStatusPayload(
       statusSnapshot.data,
-      await getHistoryPreviews(),
+      await historyPreviewsPromise,
     );
     const res = c.json(payload);
     applyHomepageCacheHeaders(res, statusSnapshot.age);
-    return res;
-  }
-
-  const fullArtifactSnapshot = await readHomepageSnapshotArtifact(c.env.DB, now);
-  if (fullArtifactSnapshot?.data.snapshot.bootstrap_mode === 'full') {
-    const res = c.json(fullArtifactSnapshot.data.snapshot);
-    applyHomepageCacheHeaders(res, fullArtifactSnapshot.age);
     return res;
   }
 
@@ -649,7 +630,7 @@ publicRoutes.get('/homepage', async (c) => {
       return res;
     }
 
-    const payload = homepageFromStatusPayload(statusPayload, await getHistoryPreviews());
+    const payload = homepageFromStatusPayload(statusPayload, await historyPreviewsPromise);
     const res = c.json(payload);
     applyHomepageCacheHeaders(res, 0);
 
@@ -674,7 +655,7 @@ publicRoutes.get('/homepage', async (c) => {
     if (staleStatus) {
       const payload = homepageFromStatusPayload(
         toSnapshotPayload(staleStatus.data),
-        await getHistoryPreviews().catch(() => ({
+        await historyPreviewsPromise.catch(() => ({
           resolvedIncidentPreview: null,
           maintenanceHistoryPreview: null,
         })),
