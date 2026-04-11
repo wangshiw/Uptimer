@@ -18,6 +18,7 @@ import {
   readStaleHomepageSnapshotArtifact,
   refreshPublicHomepageSnapshotIfNeeded,
   toHomepageSnapshotPayload,
+  writeHomepageDataSnapshot,
   writeHomepageArtifactSnapshot,
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
@@ -272,6 +273,28 @@ describe('snapshots/public-homepage', () => {
     ]);
   });
 
+  it('writes data-only homepage snapshots without rebuilding the artifact row', async () => {
+    const boundArgs: unknown[][] = [];
+    let normalizedSql = '';
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args, sql) => {
+          boundArgs.push(args);
+          normalizedSql = sql;
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const payload = samplePayload(280);
+    await writeHomepageDataSnapshot(db, 300, payload);
+
+    expect(boundArgs).toEqual([['homepage', 280, JSON.stringify(payload), 300]]);
+    expect(normalizedSql).toContain('public_snapshots.generated_at < excluded.generated_at');
+    expect(normalizedSql).toContain('public_snapshots.body_json <> excluded.body_json');
+  });
+
   it('applies bounded cache headers for homepage payloads', () => {
     const fresh = new Response('ok');
     applyHomepageCacheHeaders(fresh, 10);
@@ -358,6 +381,53 @@ describe('snapshots/public-homepage', () => {
     expect(writtenArgs).toEqual([
       ['homepage', now, JSON.stringify(storedData), now],
       ['homepage:artifact', now, JSON.stringify(storedRender), now],
+    ]);
+  });
+
+  it('forces a refresh within the same minute while still using the refresh lease', async () => {
+    vi.mocked(acquireLease).mockResolvedValue(true);
+
+    let readCount = 0;
+    const writtenArgs: unknown[][] = [];
+    const now = 1_728_000_045;
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: (args) => {
+          if (args[0] !== 'homepage') {
+            return null;
+          }
+          readCount += 1;
+          if (readCount <= 2) {
+            return {
+              generated_at: 1_728_000_031,
+              body_json: JSON.stringify(samplePayload(1_728_000_031)),
+            };
+          }
+          return {
+            generated_at: now,
+            body_json: JSON.stringify(samplePayload(now)),
+          };
+        },
+      },
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          writtenArgs.push(args);
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const compute = vi.fn(async () => samplePayload(now));
+    const refreshed = await refreshPublicHomepageSnapshotIfNeeded({ db, now, compute, force: true });
+
+    expect(refreshed).toBe(true);
+    expect(acquireLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now, 55);
+    expect(compute).toHaveBeenCalledTimes(1);
+    expect(writtenArgs).toEqual([
+      ['homepage', now, JSON.stringify(samplePayload(now)), now],
+      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(samplePayload(now))), now],
     ]);
   });
 

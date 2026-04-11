@@ -720,6 +720,33 @@ function homepageSnapshotUpsertStatement(
     .bind(key, generatedAt, bodyJson, now);
 }
 
+function homepageSnapshotPromoteStatement(
+  db: D1Database,
+  key: string,
+  generatedAt: number,
+  bodyJson: string,
+  now: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `
+      INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
+      VALUES (?1, ?2, ?3, ?4)
+      ON CONFLICT(key) DO UPDATE SET
+        generated_at = excluded.generated_at,
+        body_json = excluded.body_json,
+        updated_at = excluded.updated_at
+      WHERE
+        public_snapshots.generated_at < excluded.generated_at
+        OR (
+          public_snapshots.generated_at = excluded.generated_at
+          AND public_snapshots.body_json <> excluded.body_json
+        )
+    `,
+    )
+    .bind(key, generatedAt, bodyJson, now);
+}
+
 export async function writeHomepageSnapshot(
   db: D1Database,
   now: number,
@@ -739,6 +766,22 @@ export async function writeHomepageSnapshot(
       now,
     ),
   ]);
+}
+
+export async function writeHomepageDataSnapshot(
+  db: D1Database,
+  now: number,
+  payload: PublicHomepageResponse,
+): Promise<void> {
+  const dataBodyJson = JSON.stringify(payload);
+
+  await homepageSnapshotPromoteStatement(
+    db,
+    SNAPSHOT_KEY,
+    payload.generated_at,
+    dataBodyJson,
+    now,
+  ).run();
 }
 
 export async function writeHomepageArtifactSnapshot(
@@ -799,9 +842,11 @@ export async function refreshPublicHomepageSnapshotIfNeeded(opts: {
   db: D1Database;
   now: number;
   compute: () => Promise<unknown>;
+  force?: boolean;
 }): Promise<boolean> {
+  const force = opts.force ?? false;
   const generatedAt = await readHomepageSnapshotGeneratedAt(opts.db);
-  if (generatedAt !== null && isSameMinute(generatedAt, opts.now)) {
+  if (!force && generatedAt !== null && isSameMinute(generatedAt, opts.now)) {
     return false;
   }
 
@@ -811,7 +856,7 @@ export async function refreshPublicHomepageSnapshotIfNeeded(opts: {
   }
 
   const latestGeneratedAt = await readHomepageSnapshotGeneratedAt(opts.db);
-  if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
+  if (!force && latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
     return false;
   }
 

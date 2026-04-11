@@ -72,5 +72,11 @@ describe('admin settings homepage snapshot refresh', () => {
     expect(waitUntil).toHaveBeenCalledTimes(1);
     await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
     expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledTimes(1);
+    expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledWith({
+      db: env.DB,
+      now: expect.any(Number),
+      compute: expect.any(Function),
+      force: true,
+    });
   });
 });
