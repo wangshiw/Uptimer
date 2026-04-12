@@ -78,12 +78,12 @@ function seedScenario(db: DatabaseSync, now: number): void {
         created_at, updated_at
       )
       VALUES
-        (1, 'API', 'http', 'https://api.example.com', 60, 10000, 'Core', 0, 0, 1, 1, ?1, ?1),
-        (2, 'Website', 'http', 'https://example.com', 60, 10000, 'Core', 0, 1, 1, 1, ?1, ?1),
-        (3, 'DB', 'tcp', 'db.example.com:5432', 60, 10000, 'Backend', 1, 0, 1, 1, ?1, ?1),
-        (4, 'Hidden', 'http', 'https://hidden.example.com', 60, 10000, NULL, 0, 0, 0, 1, ?1, ?1)
+        (1, 'API', 'http', 'https://api.example.com', 60, 10000, 'Core', 0, 0, 1, 1, ?, ?),
+        (2, 'Website', 'http', 'https://example.com', 60, 10000, 'Core', 0, 1, 1, 1, ?, ?),
+        (3, 'DB', 'tcp', 'db.example.com:5432', 60, 10000, 'Backend', 1, 0, 1, 1, ?, ?),
+        (4, 'Hidden', 'http', 'https://hidden.example.com', 60, 10000, NULL, 0, 0, 0, 1, ?, ?)
     `,
-  ).run(createdAt);
+  ).run(createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt);
 
   db.prepare(
     `
@@ -92,26 +92,26 @@ function seedScenario(db: DatabaseSync, now: number): void {
         last_error, consecutive_failures, consecutive_successes
       )
       VALUES
-        (1, 'up', ?1, ?1, 120, NULL, 0, 10),
-        (2, 'down', ?1, ?1, NULL, 'timeout', 3, 0),
-        (3, 'up', ?2, ?2, 80, NULL, 0, 10),
-        (4, 'up', ?1, ?1, 50, NULL, 0, 10)
+        (1, 'up', ?, ?, 120, NULL, 0, 10),
+        (2, 'down', ?, ?, NULL, 'timeout', 3, 0),
+        (3, 'up', ?, ?, 80, NULL, 0, 10),
+        (4, 'up', ?, ?, 50, NULL, 0, 10)
     `,
-  ).run(now - 30, now - 10_000);
+  ).run(now - 30, now - 30, now - 30, now - 30, now - 10_000, now - 10_000, now - 30, now - 30);
 
   for (let index = 1; index <= 5; index += 1) {
     const checkedAt = now - 30 - index * 60;
     db.prepare(
       `
         INSERT INTO check_results (monitor_id, checked_at, status, latency_ms, attempt)
-        VALUES (1, ?1, 'up', ?2, 1)
+        VALUES (1, ?, 'up', ?, 1)
       `,
     ).run(checkedAt, 100 + index);
 
     db.prepare(
       `
         INSERT INTO check_results (monitor_id, checked_at, status, latency_ms, attempt)
-        VALUES (2, ?1, ?2, ?3, 1)
+        VALUES (2, ?, ?, ?, 1)
       `,
     ).run(checkedAt, index === 1 ? 'down' : 'up', 200 + index);
 
@@ -119,7 +119,7 @@ function seedScenario(db: DatabaseSync, now: number): void {
     db.prepare(
       `
         INSERT INTO check_results (monitor_id, checked_at, status, latency_ms, attempt)
-        VALUES (3, ?1, 'up', ?2, 1)
+        VALUES (3, ?, 'up', ?, 1)
       `,
     ).run(checkedAtDb, 50 + index);
   }
@@ -135,21 +135,37 @@ function seedScenario(db: DatabaseSync, now: number): void {
         created_at, updated_at
       )
       VALUES
-        (1, ?1, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 100, 100, 110, '[]', ?3, ?3),
-        (1, ?2, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 100, 100, 110, '[]', ?3, ?3),
-        (2, ?1, 86400, 3600, 0, 82800, 1440, 1380, 60, 0, 0, 150, 150, 200, '[]', ?3, ?3),
-        (2, ?2, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 150, 150, 200, '[]', ?3, ?3),
-        (3, ?1, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 50, 50, 60, '[]', ?3, ?3)
+        (1, ?, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 100, 100, 110, '[]', ?, ?),
+        (1, ?, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 100, 100, 110, '[]', ?, ?),
+        (2, ?, 86400, 3600, 0, 82800, 1440, 1380, 60, 0, 0, 150, 150, 200, '[]', ?, ?),
+        (2, ?, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 150, 150, 200, '[]', ?, ?),
+        (3, ?, 86400, 0, 0, 86400, 1440, 1440, 0, 0, 0, 50, 50, 60, '[]', ?, ?)
     `,
-  ).run(day1, day2, now);
+  ).run(
+    day1,
+    now,
+    now,
+    day2,
+    now,
+    now,
+    day1,
+    now,
+    now,
+    day2,
+    now,
+    now,
+    day1,
+    now,
+    now,
+  );
 
   // Active maintenance window (visible)
   db.prepare(
     `
       INSERT INTO maintenance_windows (id, title, message, starts_at, ends_at, created_at)
-      VALUES (1, 'Deploy', 'Deploying', ?1, ?2, ?1)
+      VALUES (1, 'Deploy', 'Deploying', ?, ?, ?)
     `,
-  ).run(now - 1000, now + 1000);
+  ).run(now - 1000, now + 1000, now - 1000);
   db.prepare(
     `
       INSERT INTO maintenance_window_monitors (maintenance_window_id, monitor_id)
@@ -161,9 +177,9 @@ function seedScenario(db: DatabaseSync, now: number): void {
   db.prepare(
     `
       INSERT INTO maintenance_windows (id, title, message, starts_at, ends_at, created_at)
-      VALUES (2, 'Past Maint', 'Done', ?1, ?2, ?1)
+      VALUES (2, 'Past Maint', 'Done', ?, ?, ?)
     `,
-  ).run(now - 100_000, now - 99_000);
+  ).run(now - 100_000, now - 99_000, now - 100_000);
   db.prepare(
     `
       INSERT INTO maintenance_window_monitors (maintenance_window_id, monitor_id)
@@ -173,9 +189,9 @@ function seedScenario(db: DatabaseSync, now: number): void {
   db.prepare(
     `
       INSERT INTO maintenance_windows (id, title, message, starts_at, ends_at, created_at)
-      VALUES (3, 'Hidden Maint', 'Ignore', ?1, ?2, ?1)
+      VALUES (3, 'Hidden Maint', 'Ignore', ?, ?, ?)
     `,
-  ).run(now - 200_000, now - 199_000);
+  ).run(now - 200_000, now - 199_000, now - 200_000);
   db.prepare(
     `
       INSERT INTO maintenance_window_monitors (maintenance_window_id, monitor_id)
@@ -188,13 +204,13 @@ function seedScenario(db: DatabaseSync, now: number): void {
     `
       INSERT INTO incidents (id, title, status, impact, message, started_at, resolved_at)
       VALUES
-        (1, 'Incident 1', 'investigating', 'minor', 'Investigating', ?1, NULL),
-        (2, 'Incident 2', 'investigating', 'none', 'Investigating', ?2, NULL),
-        (3, 'Incident 3', 'investigating', 'minor', 'Investigating', ?3, NULL),
-        (4, 'Incident 4', 'investigating', 'major', 'Investigating', ?4, NULL),
-        (5, 'Incident 5', 'investigating', 'critical', 'Investigating', ?5, NULL),
-        (6, 'Incident 6', 'investigating', 'minor', 'Investigating', ?6, NULL),
-        (7, 'Incident 7', 'investigating', 'none', 'Investigating', ?7, NULL)
+        (1, 'Incident 1', 'investigating', 'minor', 'Investigating', ?, NULL),
+        (2, 'Incident 2', 'investigating', 'none', 'Investigating', ?, NULL),
+        (3, 'Incident 3', 'investigating', 'minor', 'Investigating', ?, NULL),
+        (4, 'Incident 4', 'investigating', 'major', 'Investigating', ?, NULL),
+        (5, 'Incident 5', 'investigating', 'critical', 'Investigating', ?, NULL),
+        (6, 'Incident 6', 'investigating', 'minor', 'Investigating', ?, NULL),
+        (7, 'Incident 7', 'investigating', 'none', 'Investigating', ?, NULL)
     `,
   ).run(
     now - 2000 + 1,
@@ -210,13 +226,13 @@ function seedScenario(db: DatabaseSync, now: number): void {
   db.prepare(
     `
       INSERT INTO incidents (id, title, status, impact, message, started_at, resolved_at)
-      VALUES (20, 'Minor Issue', 'resolved', 'minor', 'Resolved', ?1, ?2)
+      VALUES (20, 'Minor Issue', 'resolved', 'minor', 'Resolved', ?, ?)
     `,
   ).run(now - 20_000, now - 19_000);
   db.prepare(
     `
       INSERT INTO incidents (id, title, status, impact, message, started_at, resolved_at)
-      VALUES (21, 'Hidden Issue', 'resolved', 'critical', 'Hidden', ?1, ?2)
+      VALUES (21, 'Hidden Issue', 'resolved', 'critical', 'Hidden', ?, ?)
     `,
   ).run(now - 30_000, now - 29_000);
   db.prepare(
