@@ -11,6 +11,19 @@ const MAX_AGE_SECONDS = 60;
 const MAX_STALE_SECONDS = 10 * 60;
 const REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
 const MAX_BOOTSTRAP_MONITORS = 12;
+const READ_SNAPSHOT_SQL = `
+  SELECT generated_at, body_json
+  FROM public_snapshots
+  WHERE key = ?1
+`;
+const UPSERT_SNAPSHOT_SQL = `
+  INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
+  VALUES (?1, ?2, ?3, ?4)
+  ON CONFLICT(key) DO UPDATE SET
+    generated_at = excluded.generated_at,
+    body_json = excluded.body_json,
+    updated_at = excluded.updated_at
+`;
 
 const SPLIT_SNAPSHOT_VERSION = 3;
 const LEGACY_COMBINED_SNAPSHOT_VERSION = 2;
@@ -22,6 +35,9 @@ export type PublicHomepageRenderArtifact = {
   meta_title: string;
   meta_description: string;
 };
+
+const readSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const upsertSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -49,7 +65,7 @@ function formatTime(tsSec: number, cache?: Map<number, string>): string {
 
   let formatted = '';
   try {
-    formatted = new Date(tsSec * 1000).toLocaleString();
+    formatted = new Date(tsSec * 1000).toISOString().replace('T', ' ').replace('.000Z', 'Z');
   } catch {
     formatted = '';
   }
@@ -109,13 +125,15 @@ function buildUptimeStripSvg(
   const gap = 2;
   const height = 20;
   const width = count <= 0 ? barWidth : count * barWidth + Math.max(0, count - 1) * gap;
-  let rects = '';
+  const rects: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const x = index * (barWidth + gap);
     const fill = uptimeFillFromMilli(strip.uptime_pct_milli[index]);
-    rects += `<rect x="${x}" width="${barWidth}" height="${height}" rx="1" fill="${fill}"/>`;
+    rects.push(
+      `<rect x="${x}" width="${barWidth}" height="${height}" rx="1" fill="${fill}"/>`,
+    );
   }
-  return `<svg class="usv" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">${rects}</svg>`;
+  return `<svg class="usv" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">${rects.join('')}</svg>`;
 }
 
 function buildHeartbeatStripSvg(
@@ -130,15 +148,18 @@ function buildHeartbeatStripSvg(
   const gap = 2;
   const height = 20;
   const width = count <= 0 ? barWidth : count * barWidth + Math.max(0, count - 1) * gap;
-  let rects = '';
+  const rects: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const x = index * (barWidth + gap);
-    const barHeight =
-      (height * heartbeatHeightPct(strip.status_codes[index], strip.latency_ms[index])) / 100;
+    const barHeight = Math.round(
+      (height * heartbeatHeightPct(strip.status_codes[index], strip.latency_ms[index])) / 100,
+    );
     const y = height - barHeight;
-    rects += `<rect x="${x}" y="${y.toFixed(2)}" width="${barWidth}" height="${barHeight.toFixed(2)}" rx="1" fill="${heartbeatFillFromCode(strip.status_codes[index])}"/>`;
+    rects.push(
+      `<rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="1" fill="${heartbeatFillFromCode(strip.status_codes[index])}"/>`,
+    );
   }
-  return `<svg class="usv" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">${rects}</svg>`;
+  return `<svg class="usv" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">${rects.join('')}</svg>`;
 }
 
 function renderIncidentCard(
@@ -148,40 +169,41 @@ function renderIncidentCard(
   const impactVariant =
     incident.impact === 'major' || incident.impact === 'critical' ? 'down' : 'paused';
 
-  let html = `<article class="card"><div class="row"><h4 class="mn">${escapeHtml(incident.title)}</h4><span class="sb sb-${impactVariant}">${escapeHtml(incident.impact)}</span></div><div class="ft">${formatTimestamp(incident.started_at)}</div>`;
+  const parts: string[] = [
+    `<article class="card"><div class="row"><h4 class="mn">${escapeHtml(incident.title)}</h4><span class="sb sb-${impactVariant}">${escapeHtml(incident.impact)}</span></div><div class="ft">${formatTimestamp(incident.started_at)}</div>`,
+  ];
   if (incident.message) {
-    html += `<p class="bt">${escapeHtml(incident.message)}</p>`;
+    parts.push(`<p class="bt">${escapeHtml(incident.message)}</p>`);
   }
-  html += '</article>';
-  return html;
+  parts.push('</article>');
+  return parts.join('');
 }
 
 function renderMaintenanceCard(
   window: NonNullable<PublicHomepageResponse['maintenance_history_preview']>,
-  monitorNames: Map<number, string>,
+  monitorNames: ReadonlyMap<number, string>,
   formatTimestamp: (tsSec: number) => string,
 ): string {
-  let affected = '';
+  const affected: string[] = [];
   for (let index = 0; index < window.monitor_ids.length; index += 1) {
     const monitorId = window.monitor_ids[index];
     if (typeof monitorId !== 'number') {
       continue;
     }
-    if (index > 0) {
-      affected += ', ';
-    }
-    affected += escapeHtml(monitorNames.get(monitorId) || `#${monitorId}`);
+    affected.push(escapeHtml(monitorNames.get(monitorId) || `#${monitorId}`));
   }
 
-  let html = `<article class="card"><div><h4 class="mn">${escapeHtml(window.title)}</h4><div class="ft">${formatTimestamp(window.starts_at)} - ${formatTimestamp(window.ends_at)}</div></div>`;
-  if (affected) {
-    html += `<div class="bt">Affected: ${affected}</div>`;
+  const parts: string[] = [
+    `<article class="card"><div><h4 class="mn">${escapeHtml(window.title)}</h4><div class="ft">${formatTimestamp(window.starts_at)} - ${formatTimestamp(window.ends_at)}</div></div>`,
+  ];
+  if (affected.length > 0) {
+    parts.push(`<div class="bt">Affected: ${affected.join(', ')}</div>`);
   }
   if (window.message) {
-    html += `<p class="bt">${escapeHtml(window.message)}</p>`;
+    parts.push(`<p class="bt">${escapeHtml(window.message)}</p>`);
   }
-  html += '</article>';
-  return html;
+  parts.push('</article>');
+  return parts.join('');
 }
 
 function renderPreload(
@@ -199,18 +221,9 @@ function renderPreload(
     snapshot.maintenance_windows.active.length > 0 ||
     snapshot.maintenance_windows.upcoming.length > 0 ||
     snapshot.maintenance_history_preview !== null;
-  const monitorNames = new Map<number, string>();
-  if (needsMonitorNames) {
-    if (monitorNameById) {
-      for (const [monitorId, monitorName] of monitorNameById.entries()) {
-        monitorNames.set(monitorId, monitorName);
-      }
-    } else {
-      for (const monitor of snapshot.monitors) {
-        monitorNames.set(monitor.id, monitor.name);
-      }
-    }
-  }
+  const monitorNames: ReadonlyMap<number, string> | null = needsMonitorNames
+    ? monitorNameById ?? new Map(snapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
+    : null;
   const groups = new Map<string, PublicHomepageResponse['monitors']>();
   for (const monitor of snapshot.monitors) {
     const key = monitorGroupLabel(monitor.group_name);
@@ -219,9 +232,9 @@ function renderPreload(
     groups.set(key, existing);
   }
 
-  let groupedMonitors = '';
+  const groupedMonitorsParts: string[] = [];
   for (const [groupName, groupMonitors] of groups.entries()) {
-    let monitorCards = '';
+    const monitorCardsParts: string[] = [];
     for (const monitor of groupMonitors) {
       const uptimePct =
         typeof monitor.uptime_30d?.uptime_pct === 'number'
@@ -233,10 +246,14 @@ function renderPreload(
         ? `Last checked: ${formatTimestamp(monitor.last_checked_at)}`
         : 'Never checked';
 
-      monitorCards += `<article class="card"><div class="row"><div class="lhs"><span class="dot dot-${status}"></span><div class="ut"><div class="mn">${escapeHtml(monitor.name)}</div><div class="mt">${escapeHtml(monitor.type)}</div></div></div><div class="rhs"><span class="up">${escapeHtml(uptimePct)}</span><span class="sb sb-${status}">${statusLabel}</span></div></div><div><div class="lbl">Availability (30d)</div><div class="strip">${buildUptimeStripSvg(monitor.uptime_day_strip)}</div></div><div><div class="lbl">Recent checks</div><div class="strip">${buildHeartbeatStripSvg(monitor.heartbeat_strip)}</div></div><div class="ft">${lastCheckedLabel}</div></article>`;
+      monitorCardsParts.push(
+        `<article class="card"><div class="row"><div class="lhs"><span class="dot dot-${status}"></span><div class="ut"><div class="mn">${escapeHtml(monitor.name)}</div><div class="mt">${escapeHtml(monitor.type)}</div></div></div><div class="rhs"><span class="up">${escapeHtml(uptimePct)}</span><span class="sb sb-${status}">${statusLabel}</span></div></div><div><div class="lbl">Availability (30d)</div><div class="strip">${buildUptimeStripSvg(monitor.uptime_day_strip)}</div></div><div><div class="lbl">Recent checks</div><div class="strip">${buildHeartbeatStripSvg(monitor.heartbeat_strip)}</div></div><div class="ft">${lastCheckedLabel}</div></article>`,
+      );
     }
 
-    groupedMonitors += `<section class="sg"><div class="sgh"><h4 class="sgt">${escapeHtml(groupName)}</h4><span class="sgc">${groupMonitors.length}</span></div><div class="grid">${monitorCards}</div></section>`;
+    groupedMonitorsParts.push(
+      `<section class="sg"><div class="sgh"><h4 class="sgt">${escapeHtml(groupName)}</h4><span class="sgc">${groupMonitors.length}</span></div><div class="grid">${monitorCardsParts.join('')}</div></section>`,
+    );
   }
 
   const activeMaintenance = snapshot.maintenance_windows.active;
@@ -244,32 +261,38 @@ function renderPreload(
   const hiddenMonitorCount = Math.max(0, snapshot.monitor_count_total - snapshot.monitors.length);
   let maintenanceSection = '';
   if (activeMaintenance.length > 0 || upcomingMaintenance.length > 0) {
-    let activeCards = '';
+    const activeCards: string[] = [];
     for (const window of activeMaintenance) {
-      activeCards += renderMaintenanceCard(window, monitorNames, formatTimestamp);
+      if (monitorNames) {
+        activeCards.push(renderMaintenanceCard(window, monitorNames, formatTimestamp));
+      }
     }
-    let upcomingCards = '';
+    const upcomingCards: string[] = [];
     for (const window of upcomingMaintenance) {
-      upcomingCards += renderMaintenanceCard(window, monitorNames, formatTimestamp);
+      if (monitorNames) {
+        upcomingCards.push(renderMaintenanceCard(window, monitorNames, formatTimestamp));
+      }
     }
 
-    maintenanceSection = `<section class="sec"><h3 class="sh">Scheduled Maintenance</h3>${activeCards ? `<div class="st">${activeCards}</div>` : ''}${upcomingCards ? `<div class="st">${upcomingCards}</div>` : ''}</section>`;
+    maintenanceSection = `<section class="sec"><h3 class="sh">Scheduled Maintenance</h3>${activeCards.length > 0 ? `<div class="st">${activeCards.join('')}</div>` : ''}${upcomingCards.length > 0 ? `<div class="st">${upcomingCards.join('')}</div>` : ''}</section>`;
   }
 
   let incidentSection = '';
   if (snapshot.active_incidents.length > 0) {
-    let incidentCards = '';
+    const incidentCards: string[] = [];
     for (const incident of snapshot.active_incidents) {
-      incidentCards += renderIncidentCard(incident, formatTimestamp);
+      incidentCards.push(renderIncidentCard(incident, formatTimestamp));
     }
-    incidentSection = `<section class="sec"><h3 class="sh">Active Incidents</h3><div class="st">${incidentCards}</div></section>`;
+    incidentSection = `<section class="sec"><h3 class="sh">Active Incidents</h3><div class="st">${incidentCards.join('')}</div></section>`;
   }
 
   const incidentHistory = snapshot.resolved_incident_preview
     ? renderIncidentCard(snapshot.resolved_incident_preview, formatTimestamp)
     : '<div class="card">No past incidents</div>';
   const maintenanceHistory = snapshot.maintenance_history_preview
-    ? renderMaintenanceCard(snapshot.maintenance_history_preview, monitorNames, formatTimestamp)
+    ? monitorNames
+      ? renderMaintenanceCard(snapshot.maintenance_history_preview, monitorNames, formatTimestamp)
+      : '<div class="card">No past maintenance</div>'
     : '<div class="card">No past maintenance</div>';
   const descriptionHtml = siteDescription
     ? `<div class="ud">${escapeHtml(siteDescription)}</div>`
@@ -279,16 +302,19 @@ function renderPreload(
       ? `<div class="card ft">${hiddenMonitorCount} more services will appear after the app finishes loading.</div>`
       : '';
 
-  return `<div class="hp"><header class="uh"><div class="uw uhw"><div class="ut"><div class="un">${escapeHtml(siteTitle)}</div>${descriptionHtml}</div><span class="sb sb-${overall}">${escapeHtml(overall)}</span></div></header><main class="uw um"><section class="bn"><div class="bt">${escapeHtml(bannerTitle)}</div><div class="bu">Updated: ${formatTimestamp(generatedAt)}</div></section>${maintenanceSection}${incidentSection}<section class="sec"><h3 class="sh">Services</h3>${groupedMonitors}${hiddenMonitorMessage}</section><section class="sec ih"><div><h3 class="sh">Incident History</h3>${incidentHistory}</div><div><h3 class="sh">Maintenance History</h3>${maintenanceHistory}</div></section></main></div>`;
+  return `<div class="hp"><header class="uh"><div class="uw uhw"><div class="ut"><div class="un">${escapeHtml(siteTitle)}</div>${descriptionHtml}</div><span class="sb sb-${overall}">${escapeHtml(overall)}</span></div></header><main class="uw um"><section class="bn"><div class="bt">${escapeHtml(bannerTitle)}</div><div class="bu">Updated: ${formatTimestamp(generatedAt)}</div></section>${maintenanceSection}${incidentSection}<section class="sec"><h3 class="sh">Services</h3>${groupedMonitorsParts.join('')}${hiddenMonitorMessage}</section><section class="sec ih"><div><h3 class="sh">Incident History</h3>${incidentHistory}</div><div><h3 class="sh">Maintenance History</h3>${maintenanceHistory}</div></section></main></div>`;
 }
 
 export function buildHomepageRenderArtifact(
   snapshot: PublicHomepageResponse,
 ): PublicHomepageRenderArtifact {
-  const allMonitorNames = new Map<number, string>();
-  for (const monitor of snapshot.monitors) {
-    allMonitorNames.set(monitor.id, monitor.name);
-  }
+  const needsMonitorNames =
+    snapshot.maintenance_windows.active.length > 0 ||
+    snapshot.maintenance_windows.upcoming.length > 0 ||
+    snapshot.maintenance_history_preview !== null;
+  const allMonitorNames = needsMonitorNames
+    ? new Map(snapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
+    : undefined;
   const bootstrapSnapshot =
     snapshot.bootstrap_mode === 'partial' || snapshot.monitors.length > MAX_BOOTSTRAP_MONITORS
       ? {
@@ -417,14 +443,13 @@ async function readSnapshotRow(
   key: string,
 ): Promise<{ generated_at: number; body_json: string } | null> {
   try {
-    return await db
-      .prepare(
-        `
-        SELECT generated_at, body_json
-        FROM public_snapshots
-        WHERE key = ?1
-      `,
-      )
+    const cached = readSnapshotStatementByDb.get(db);
+    const statement = cached ?? db.prepare(READ_SNAPSHOT_SQL);
+    if (!cached) {
+      readSnapshotStatementByDb.set(db, statement);
+    }
+
+    return await statement
       .bind(key)
       .first<{ generated_at: number; body_json: string }>();
   } catch (err) {
@@ -706,18 +731,13 @@ function homepageSnapshotUpsertStatement(
   bodyJson: string,
   now: number,
 ): D1PreparedStatement {
-  return db
-    .prepare(
-      `
-      INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
-      VALUES (?1, ?2, ?3, ?4)
-      ON CONFLICT(key) DO UPDATE SET
-        generated_at = excluded.generated_at,
-        body_json = excluded.body_json,
-        updated_at = excluded.updated_at
-    `,
-    )
-    .bind(key, generatedAt, bodyJson, now);
+  const cached = upsertSnapshotStatementByDb.get(db);
+  const statement = cached ?? db.prepare(UPSERT_SNAPSHOT_SQL);
+  if (!cached) {
+    upsertSnapshotStatementByDb.set(db, statement);
+  }
+
+  return statement.bind(key, generatedAt, bodyJson, now);
 }
 
 export async function writeHomepageSnapshot(

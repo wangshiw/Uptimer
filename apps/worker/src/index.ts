@@ -1,66 +1,70 @@
-import { Hono } from 'hono';
-
 import type { Env } from './env';
-import { handleError, handleNotFound } from './middleware/errors';
-import { adminRoutes } from './routes/admin';
-import { publicRoutes } from './routes/public';
-import { runDailyRollup } from './scheduler/daily-rollup';
-import { runRetention } from './scheduler/retention';
-import { runScheduledTick } from './scheduler/scheduled';
 
-const app = new Hono<{ Bindings: Env }>();
-
-// Minimal CORS support so Pages (or any web UI) can call the API when hosted on a different origin
-// (e.g. Pages on *.pages.dev and API on *.workers.dev). We reflect the Origin to keep it simple and
-// avoid hardcoding a single hostname in the Worker config.
-app.use('/api/*', async (c, next) => {
-  const origin = c.req.header('Origin');
-  if (origin) {
-    c.header('Access-Control-Allow-Origin', origin);
-    c.header('Vary', 'Origin');
-    c.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    c.header('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+async function handleInternalHomepageRefresh(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
   }
 
-  if (c.req.method === 'OPTIONS') {
-    return c.body(null, 204);
+  const token = (await request.text()).trim();
+  if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+    return new Response('Forbidden', { status: 403 });
   }
 
-  await next();
-});
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const [{ computePublicHomepagePayload }, { refreshPublicHomepageSnapshotIfNeeded }] =
+      await Promise.all([import('./public/homepage'), import('./snapshots')]);
+    const refreshed = await refreshPublicHomepageSnapshotIfNeeded({
+      db: env.DB,
+      now,
+      compute: () => computePublicHomepagePayload(env.DB, now),
+    });
 
-// Redirect legacy `/api/*` paths to the versioned API.
-// This is useful when Pages (dev/prod) proxies `/api` to this Worker but the
-// frontend calls `/api/v1/...`.
-app.use('/api/*', async (c, next) => {
-  const path = new URL(c.req.url).pathname;
-  if (path === '/api/v1' || path.startsWith('/api/v1/')) {
-    await next();
-    return;
+    const res = new Response(JSON.stringify({ ok: true, refreshed }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    });
+    return res;
+  } catch (err) {
+    console.warn('internal refresh: homepage failed', err);
+    return new Response(JSON.stringify({ ok: false }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    });
   }
-
-  const url = new URL(c.req.url);
-  url.pathname = `/api/v1${path.slice('/api'.length)}`;
-  return c.redirect(url.toString(), 308);
-});
-
-app.onError(handleError);
-app.notFound(handleNotFound);
-
-app.get('/', (c) => c.text('ok'));
-
-app.route('/api/v1/public', publicRoutes);
-app.route('/api/v1/admin', adminRoutes);
+}
 
 export default {
-  fetch: app.fetch,
+  fetch: async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {
+    const url = new URL(request.url);
+    if (url.pathname === '/api/v1/internal/refresh/homepage') {
+      return handleInternalHomepageRefresh(request, env);
+    }
+
+    const mod = await import('./fetch-handler');
+    return mod.handleFetch(request, env, ctx);
+  },
   scheduled: async (controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
     if (controller.cron === '0 0 * * *') {
+      const [{ runRetention }, { runDailyRollup }] = await Promise.all([
+        import('./scheduler/retention'),
+        import('./scheduler/daily-rollup'),
+      ]);
       await runRetention(env, controller);
       await runDailyRollup(env, controller, ctx);
       return;
     }
 
+    const { runScheduledTick } = await import('./scheduler/scheduled');
     await runScheduledTick(env, ctx);
   },
-};
+} satisfies ExportedHandler<Env>;

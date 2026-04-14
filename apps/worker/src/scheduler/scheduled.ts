@@ -21,8 +21,6 @@ import {
 import { runTcpCheck } from '../monitor/tcp';
 import type { CheckOutcome } from '../monitor/types';
 import { dispatchWebhookToChannels, type WebhookChannel } from '../notify/webhook';
-import { computePublicHomepageArtifactPayload } from '../public/homepage';
-import { refreshPublicHomepageArtifactSnapshotIfNeeded } from '../snapshots';
 import { readSettings } from '../settings';
 import { acquireLease } from './lock';
 
@@ -34,6 +32,52 @@ const PERSIST_BATCH_SIZE = 25;
 
 // Look back a bit so maintenance start/end notifications are not missed if a tick is delayed.
 const MAINTENANCE_EVENT_LOOKBACK_SECONDS = 10 * 60;
+
+async function refreshHomepageSnapshotViaService(env: Env): Promise<void> {
+  if (!env.SELF) {
+    throw new Error('SELF service binding missing');
+  }
+  if (!env.ADMIN_TOKEN) {
+    throw new Error('ADMIN_TOKEN missing');
+  }
+
+  const res = await env.SELF.fetch(
+    new Request('http://internal/api/v1/internal/refresh/homepage', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+      },
+      body: env.ADMIN_TOKEN,
+    }),
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`service refresh failed: HTTP ${res.status} ${text}`.trim());
+  }
+}
+
+async function refreshHomepageSnapshotInline(env: Env, now: number): Promise<void> {
+  const [{ computePublicHomepagePayload }, { refreshPublicHomepageSnapshot }] = await Promise.all([
+    import('../public/homepage'),
+    import('../snapshots'),
+  ]);
+
+  await refreshPublicHomepageSnapshot({
+    db: env.DB,
+    now,
+    compute: () => computePublicHomepagePayload(env.DB, now),
+  });
+}
+
+type CachedMonitorHttpJson = {
+  http_headers_json: string | null;
+  expected_status_json: string | null;
+  httpHeaders: Record<string, string> | null;
+  expectedStatus: number[] | null;
+};
+
+const cachedMonitorHttpJsonById = new Map<number, CachedMonitorHttpJson>();
 
 type DueMonitorRow = {
   id: number;
@@ -72,6 +116,103 @@ type NotifyContext = {
   channels: WebhookChannelWithMeta[];
 };
 
+const listActiveWebhookChannelsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const listDueMonitorsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const persistStatementTemplatesByDb = new WeakMap<D1Database, PersistStatementTemplates>();
+const activeWebhookChannelsCacheByDb = new WeakMap<
+  D1Database,
+  { fetchedAtMs: number; channels: WebhookChannelWithMeta[] }
+>();
+
+const LIST_ACTIVE_WEBHOOK_CHANNELS_SQL = `
+  SELECT id, name, config_json, created_at
+  FROM notification_channels
+  WHERE is_active = 1 AND type = 'webhook'
+  ORDER BY id
+`;
+const ACTIVE_WEBHOOK_CHANNELS_CACHE_TTL_MS = 2 * 60_000;
+
+const LIST_DUE_MONITORS_SQL = `
+  SELECT
+    m.id,
+    m.name,
+    m.type,
+    m.target,
+    m.interval_sec,
+    m.timeout_ms,
+    m.http_method,
+    m.http_headers_json,
+    m.http_body,
+    m.expected_status_json,
+    m.response_keyword,
+    m.response_keyword_mode,
+    m.response_forbidden_keyword,
+    m.response_forbidden_keyword_mode,
+    s.status AS state_status,
+    s.last_error AS state_last_error,
+    s.last_changed_at,
+    s.consecutive_failures,
+    s.consecutive_successes
+  FROM monitors m
+  LEFT JOIN monitor_state s ON s.monitor_id = m.id
+  WHERE m.is_active = 1
+    AND (s.status IS NULL OR s.status != 'paused')
+    AND (s.last_checked_at IS NULL OR s.last_checked_at <= ?1 - m.interval_sec)
+  ORDER BY m.id
+`;
+
+const PERSIST_STATEMENTS_SQL = {
+  insertCheckResult: `
+    INSERT INTO check_results (
+      monitor_id,
+      checked_at,
+      status,
+      latency_ms,
+      http_status,
+      error,
+      location,
+      attempt
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+  `,
+  upsertMonitorState: `
+    INSERT INTO monitor_state (
+      monitor_id,
+      status,
+      last_checked_at,
+      last_changed_at,
+      last_latency_ms,
+      last_error,
+      consecutive_failures,
+      consecutive_successes
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+    ON CONFLICT(monitor_id) DO UPDATE SET
+      status = excluded.status,
+      last_checked_at = excluded.last_checked_at,
+      last_changed_at = excluded.last_changed_at,
+      last_latency_ms = excluded.last_latency_ms,
+      last_error = excluded.last_error,
+      consecutive_failures = excluded.consecutive_failures,
+      consecutive_successes = excluded.consecutive_successes
+  `,
+  openOutageIfMissing: `
+    INSERT INTO outages (monitor_id, started_at, ended_at, initial_error, last_error)
+    SELECT ?1, ?2, NULL, ?3, ?4
+    WHERE NOT EXISTS (
+      SELECT 1 FROM outages WHERE monitor_id = ?5 AND ended_at IS NULL
+    )
+  `,
+  closeOutage: `
+    UPDATE outages
+    SET ended_at = ?1
+    WHERE monitor_id = ?2 AND ended_at IS NULL
+  `,
+  updateOutageLastError: `
+    UPDATE outages
+    SET last_error = ?1
+    WHERE monitor_id = ?2 AND ended_at IS NULL
+  `,
+} as const;
+
 type CompletedDueMonitor = {
   row: DueMonitorRow;
   checkedAt: number;
@@ -84,23 +225,31 @@ type CompletedDueMonitor = {
 };
 
 async function listActiveWebhookChannels(db: D1Database): Promise<WebhookChannelWithMeta[]> {
-  const { results } = await db
-    .prepare(
-      `
-      SELECT id, name, config_json, created_at
-      FROM notification_channels
-      WHERE is_active = 1 AND type = 'webhook'
-      ORDER BY id
-    `,
-    )
-    .all<ActiveWebhookChannelRow>();
+  const cachedResult = activeWebhookChannelsCacheByDb.get(db);
+  if (
+    cachedResult &&
+    Date.now() - cachedResult.fetchedAtMs < ACTIVE_WEBHOOK_CHANNELS_CACHE_TTL_MS
+  ) {
+    return cachedResult.channels;
+  }
 
-  return (results ?? []).map((r) => ({
+  const cached = listActiveWebhookChannelsStatementByDb.get(db);
+  const statement = cached ?? db.prepare(LIST_ACTIVE_WEBHOOK_CHANNELS_SQL);
+  if (!cached) {
+    listActiveWebhookChannelsStatementByDb.set(db, statement);
+  }
+
+  const { results } = await statement.all<ActiveWebhookChannelRow>();
+
+  const channels = (results ?? []).map((r) => ({
     id: r.id,
     name: r.name,
     config: parseDbJson(webhookChannelConfigSchema, r.config_json, { field: 'config_json' }),
     created_at: r.created_at,
   }));
+
+  activeWebhookChannelsCacheByDb.set(db, { fetchedAtMs: Date.now(), channels });
+  return channels;
 }
 
 async function listMaintenanceSuppressedMonitorIds(
@@ -258,39 +407,13 @@ function toMonitorStatus(value: string | null): MonitorStatus | null {
 }
 
 async function listDueMonitors(db: D1Database, checkedAt: number): Promise<DueMonitorRow[]> {
-  const { results } = await db
-    .prepare(
-      `
-      SELECT
-        m.id,
-        m.name,
-        m.type,
-        m.target,
-        m.interval_sec,
-        m.timeout_ms,
-        m.http_method,
-        m.http_headers_json,
-        m.http_body,
-        m.expected_status_json,
-        m.response_keyword,
-        m.response_keyword_mode,
-        m.response_forbidden_keyword,
-        m.response_forbidden_keyword_mode,
-        s.status AS state_status,
-        s.last_error AS state_last_error,
-        s.last_changed_at,
-        s.consecutive_failures,
-        s.consecutive_successes
-      FROM monitors m
-      LEFT JOIN monitor_state s ON s.monitor_id = m.id
-      WHERE m.is_active = 1
-        AND (s.status IS NULL OR s.status != 'paused')
-        AND (s.last_checked_at IS NULL OR s.last_checked_at <= ?1 - m.interval_sec)
-      ORDER BY m.id
-    `,
-    )
-    .bind(checkedAt)
-    .all<DueMonitorRow>();
+  const cached = listDueMonitorsStatementByDb.get(db);
+  const statement = cached ?? db.prepare(LIST_DUE_MONITORS_SQL);
+  if (!cached) {
+    listDueMonitorsStatementByDb.set(db, statement);
+  }
+
+  const { results } = await statement.bind(checkedAt).all<DueMonitorRow>();
 
   return results ?? [];
 }
@@ -309,7 +432,18 @@ function computeStateLastError(
   return outcome.status === 'up' ? null : outcome.error;
 }
 
-function buildPersistStatements(completed: CompletedDueMonitor, db: D1Database): D1PreparedStatement[] {
+type PersistStatementTemplates = {
+  insertCheckResult: D1PreparedStatement;
+  upsertMonitorState: D1PreparedStatement;
+  openOutageIfMissing: D1PreparedStatement;
+  closeOutage: D1PreparedStatement;
+  updateOutageLastError: D1PreparedStatement;
+};
+
+function buildPersistStatements(
+  completed: CompletedDueMonitor,
+  templates: PersistStatementTemplates,
+): D1PreparedStatement[] {
   const {
     row,
     checkedAt,
@@ -323,20 +457,7 @@ function buildPersistStatements(completed: CompletedDueMonitor, db: D1Database):
   const statements: D1PreparedStatement[] = [];
 
   statements.push(
-    db.prepare(
-      `
-      INSERT INTO check_results (
-        monitor_id,
-        checked_at,
-        status,
-        latency_ms,
-        http_status,
-        error,
-        location,
-        attempt
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-    `,
-    ).bind(
+    templates.insertCheckResult.bind(
       row.id,
       checkedAt,
       outcome.status,
@@ -349,28 +470,7 @@ function buildPersistStatements(completed: CompletedDueMonitor, db: D1Database):
   );
 
   statements.push(
-    db.prepare(
-      `
-      INSERT INTO monitor_state (
-        monitor_id,
-        status,
-        last_checked_at,
-        last_changed_at,
-        last_latency_ms,
-        last_error,
-        consecutive_failures,
-        consecutive_successes
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-      ON CONFLICT(monitor_id) DO UPDATE SET
-        status = excluded.status,
-        last_checked_at = excluded.last_checked_at,
-        last_changed_at = excluded.last_changed_at,
-        last_latency_ms = excluded.last_latency_ms,
-        last_error = excluded.last_error,
-        consecutive_failures = excluded.consecutive_failures,
-        consecutive_successes = excluded.consecutive_successes
-    `,
-    ).bind(
+    templates.upsertMonitorState.bind(
       row.id,
       next.status,
       checkedAt,
@@ -384,35 +484,21 @@ function buildPersistStatements(completed: CompletedDueMonitor, db: D1Database):
 
   if (outageAction === 'open') {
     statements.push(
-      db.prepare(
-        `
-        INSERT INTO outages (monitor_id, started_at, ended_at, initial_error, last_error)
-        SELECT ?1, ?2, NULL, ?3, ?4
-        WHERE NOT EXISTS (
-          SELECT 1 FROM outages WHERE monitor_id = ?5 AND ended_at IS NULL
-        )
-      `,
-      ).bind(row.id, checkedAt, checkError ?? 'down', checkError ?? 'down', row.id),
+      templates.openOutageIfMissing.bind(
+        row.id,
+        checkedAt,
+        checkError ?? 'down',
+        checkError ?? 'down',
+        row.id,
+      ),
     );
   } else if (outageAction === 'close') {
     statements.push(
-      db.prepare(
-        `
-        UPDATE outages
-        SET ended_at = ?1
-        WHERE monitor_id = ?2 AND ended_at IS NULL
-      `,
-      ).bind(checkedAt, row.id),
+      templates.closeOutage.bind(checkedAt, row.id),
     );
   } else if (outageAction === 'update' && checkError) {
     statements.push(
-      db.prepare(
-        `
-        UPDATE outages
-        SET last_error = ?1
-        WHERE monitor_id = ?2 AND ended_at IS NULL
-      `,
-      ).bind(checkError, row.id),
+      templates.updateOutageLastError.bind(checkError, row.id),
     );
   }
 
@@ -450,16 +536,31 @@ async function runDueMonitor(
           attempts: 1,
         };
       } else {
-        const httpHeaders = parseDbJsonNullable(httpHeadersJsonSchema, row.http_headers_json, {
-          field: 'http_headers_json',
-        });
-        const expectedStatus = parseDbJsonNullable(
-          expectedStatusJsonSchema,
-          row.expected_status_json,
-          {
-            field: 'expected_status_json',
-          },
-        );
+        const cached = cachedMonitorHttpJsonById.get(row.id);
+        const cachedMatches =
+          cached &&
+          cached.http_headers_json === row.http_headers_json &&
+          cached.expected_status_json === row.expected_status_json;
+
+        const httpHeaders = cachedMatches
+          ? cached.httpHeaders
+          : parseDbJsonNullable(httpHeadersJsonSchema, row.http_headers_json, {
+              field: 'http_headers_json',
+            });
+        const expectedStatus = cachedMatches
+          ? cached.expectedStatus
+          : parseDbJsonNullable(expectedStatusJsonSchema, row.expected_status_json, {
+              field: 'expected_status_json',
+            });
+
+        if (!cachedMatches) {
+          cachedMonitorHttpJsonById.set(row.id, {
+            http_headers_json: row.http_headers_json,
+            expected_status_json: row.expected_status_json,
+            httpHeaders,
+            expectedStatus,
+          });
+        }
 
         outcome = await runHttpCheck({
           url: row.target,
@@ -514,12 +615,24 @@ async function persistCompletedMonitors(
   db: D1Database,
   completed: CompletedDueMonitor[],
 ): Promise<void> {
+  const cached = persistStatementTemplatesByDb.get(db);
+  const templates = cached ?? {
+    insertCheckResult: db.prepare(PERSIST_STATEMENTS_SQL.insertCheckResult),
+    upsertMonitorState: db.prepare(PERSIST_STATEMENTS_SQL.upsertMonitorState),
+    openOutageIfMissing: db.prepare(PERSIST_STATEMENTS_SQL.openOutageIfMissing),
+    closeOutage: db.prepare(PERSIST_STATEMENTS_SQL.closeOutage),
+    updateOutageLastError: db.prepare(PERSIST_STATEMENTS_SQL.updateOutageLastError),
+  };
+  if (!cached) {
+    persistStatementTemplatesByDb.set(db, templates);
+  }
+
   for (let i = 0; i < completed.length; i += PERSIST_BATCH_SIZE) {
     const chunk = completed.slice(i, i + PERSIST_BATCH_SIZE);
     const statements: D1PreparedStatement[] = [];
 
     for (const monitor of chunk) {
-      statements.push(...buildPersistStatements(monitor, db));
+      statements.push(...buildPersistStatements(monitor, templates));
     }
 
     if (statements.length > 0) {
@@ -592,13 +705,16 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   const now = Math.floor(Date.now() / 1000);
   const checkedAt = Math.floor(now / 60) * 60;
   const queueHomepageRefresh = () =>
-    refreshPublicHomepageArtifactSnapshotIfNeeded({
-      db: env.DB,
-      now,
-      compute: () => computePublicHomepageArtifactPayload(env.DB, Math.floor(Date.now() / 1000)),
-    }).catch((err) => {
-      console.warn('homepage snapshot: refresh failed', err);
-    });
+    env.SELF
+      ? refreshHomepageSnapshotViaService(env).catch(async (err) => {
+          console.warn('homepage snapshot: service refresh failed', err);
+          await refreshHomepageSnapshotInline(env, now).catch((fallbackErr) => {
+            console.warn('homepage snapshot: refresh failed', fallbackErr);
+          });
+        })
+      : refreshHomepageSnapshotInline(env, now).catch((err) => {
+          console.warn('homepage snapshot: refresh failed', err);
+        });
 
   const acquired = await acquireLease(env.DB, LOCK_NAME, now, LOCK_LEASE_SECONDS);
   if (!acquired) {
@@ -728,10 +844,36 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     }
   }
 
+  let httpCount = 0;
+  let tcpCount = 0;
+  let assertionCount = 0;
+  let attemptTotal = 0;
+  let downCount = 0;
+  let unknownCount = 0;
+  for (const monitor of completed) {
+    attemptTotal += monitor.outcome.attempts;
+    if (monitor.outcome.status === 'down') downCount += 1;
+    else if (monitor.outcome.status === 'unknown') unknownCount += 1;
+
+    if (monitor.row.type === 'http') {
+      httpCount += 1;
+      if (monitor.row.response_keyword || monitor.row.response_forbidden_keyword) {
+        assertionCount += 1;
+      }
+    } else if (monitor.row.type === 'tcp') {
+      tcpCount += 1;
+    }
+  }
+
   if (rejected.length > 0) {
-    console.error(`scheduled: ${rejected.length}/${settled.length} monitors failed`, rejected[0]);
+    console.error(
+      `scheduled: ${rejected.length}/${settled.length} monitors failed at ${checkedAt} attempts=${attemptTotal} http=${httpCount} tcp=${tcpCount} assertions=${assertionCount} down=${downCount} unknown=${unknownCount}`,
+      rejected[0],
+    );
   } else {
-    console.log(`scheduled: processed ${settled.length} monitors at ${checkedAt}`);
+    console.log(
+      `scheduled: processed ${settled.length} monitors at ${checkedAt} attempts=${attemptTotal} http=${httpCount} tcp=${tcpCount} assertions=${assertionCount} down=${downCount} unknown=${unknownCount}`,
+    );
   }
 
   ctx.waitUntil(queueHomepageRefresh());

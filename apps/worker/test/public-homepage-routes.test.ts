@@ -278,7 +278,7 @@ describe('public homepage route', () => {
     expect(res.headers.get('Vary')).toContain('Origin');
   });
 
-  it('partitions cached homepage responses by Origin when app-level CORS reflection is enabled', async () => {
+  it('skips shared edge cache for homepage responses even when app-level CORS reflection is enabled', async () => {
     const payload = samplePayload(190);
     const dbReads: string[] = [];
     vi.spyOn(Date, 'now').mockReturnValue(200_000);
@@ -317,7 +317,33 @@ describe('public homepage route', () => {
     expect(first.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
     expect(second.headers.get('Access-Control-Allow-Origin')).toBe('https://two.example.com');
     expect(third.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
-    expect(dbReads).toEqual(['homepage', 'homepage']);
+    expect(dbReads).toEqual(['homepage', 'homepage', 'homepage']);
+  });
+
+  it('serves a slightly stale homepage snapshot via the worker hot path', async () => {
+    const payload = samplePayload(139);
+    const dbReads: string[] = [];
+    vi.spyOn(Date, 'now').mockReturnValue(200 * 1000);
+
+    const res = await requestHomepageViaApp('/api/v1/public/homepage', [
+      {
+        match: 'from public_snapshots',
+        first: (args) => {
+          dbReads.push(String(args[0]));
+          return args[0] === 'homepage'
+            ? {
+                generated_at: payload.generated_at,
+                body_json: JSON.stringify(payload),
+              }
+            : null;
+        },
+      },
+    ]);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(payload);
+    expect(dbReads).toEqual(['homepage']);
+    expect(res.headers.get('Cache-Control')).toContain('max-age=0');
   });
 
   it('falls back to the fresh public status snapshot when the full homepage snapshot is missing', async () => {
