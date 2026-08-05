@@ -8,7 +8,9 @@ const BASE_CONFIG = {
   method: 'GET' as const,
   headers: null,
   body: null,
+  followRedirects: true,
   expectedStatus: null,
+  forbiddenStatus: null,
   responseKeyword: null,
   responseKeywordMode: null,
   responseForbiddenKeyword: null,
@@ -42,6 +44,7 @@ describe('monitor/http', () => {
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
       expect(init?.cache).toBe('no-store');
+      expect(init?.redirect).toBe('follow');
       expect(headers.get('user-agent')).toBe('Uptimer/0.1');
       expect((init?.cf as { cacheTtlByStatus?: unknown })?.cacheTtlByStatus).toEqual({
         '100-599': -1,
@@ -81,7 +84,9 @@ describe('monitor/http', () => {
 
   it('marks mismatched status codes as down', async () => {
     vi.useFakeTimers();
-    globalThis.fetch = vi.fn(async () => new Response('teapot', { status: 418 })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(
+      async () => new Response('teapot', { status: 418 }),
+    ) as unknown as typeof fetch;
 
     const outcomePromise = runHttpCheck({ ...BASE_CONFIG, expectedStatus: [200] });
     await vi.advanceTimersByTimeAsync(1_200);
@@ -93,10 +98,136 @@ describe('monitor/http', () => {
     expect(outcome.attempts).toBe(3);
   });
 
+  it('uses manual redirect mode and only accepts 3xx statuses explicitly', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.redirect).toBe('manual');
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://example.com/final' },
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const defaultOutcomePromise = runHttpCheck({ ...BASE_CONFIG, followRedirects: false });
+    await vi.advanceTimersByTimeAsync(1_200);
+    const defaultOutcome = await defaultOutcomePromise;
+
+    expect(defaultOutcome.status).toBe('down');
+    expect(defaultOutcome.httpStatus).toBe(302);
+    expect(defaultOutcome.error).toBe('Unexpected HTTP status: 302');
+    expect(defaultOutcome.attempts).toBe(3);
+
+    const explicitOutcome = await runHttpCheck({
+      ...BASE_CONFIG,
+      followRedirects: false,
+      expectedStatus: [302],
+    });
+
+    expect(explicitOutcome.status).toBe('up');
+    expect(explicitOutcome.httpStatus).toBe(302);
+    expect(explicitOutcome.error).toBeNull();
+    expect(explicitOutcome.attempts).toBe(1);
+  });
+
+  it('accepts status codes inside expected ranges', async () => {
+    globalThis.fetch = vi.fn(
+      async () => new Response(null, { status: 204 }),
+    ) as unknown as typeof fetch;
+
+    const outcome = await runHttpCheck({
+      ...BASE_CONFIG,
+      expectedStatus: [{ from: 200, to: 299 }],
+    });
+
+    expect(outcome.status).toBe('up');
+    expect(outcome.httpStatus).toBe(204);
+    expect(outcome.error).toBeNull();
+    expect(outcome.attempts).toBe(1);
+  });
+
+  it('rejects status codes outside expected ranges', async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(
+      async () => new Response('moved', { status: 301 }),
+    ) as unknown as typeof fetch;
+
+    const outcomePromise = runHttpCheck({
+      ...BASE_CONFIG,
+      expectedStatus: [{ from: 200, to: 299 }],
+    });
+    await vi.advanceTimersByTimeAsync(1_200);
+    const outcome = await outcomePromise;
+
+    expect(outcome.status).toBe('down');
+    expect(outcome.httpStatus).toBe(301);
+    expect(outcome.error).toBe('Unexpected HTTP status: 301');
+    expect(outcome.attempts).toBe(3);
+  });
+
+  it('treats forbidden status codes as down even when they match expected rules', async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(
+      async () => new Response(null, { status: 204 }),
+    ) as unknown as typeof fetch;
+
+    const outcomePromise = runHttpCheck({
+      ...BASE_CONFIG,
+      expectedStatus: [{ from: 200, to: 299 }],
+      forbiddenStatus: [204],
+    });
+    await vi.advanceTimersByTimeAsync(1_200);
+    const outcome = await outcomePromise;
+
+    expect(outcome.status).toBe('down');
+    expect(outcome.httpStatus).toBe(204);
+    expect(outcome.error).toBe('Forbidden HTTP status: 204');
+    expect(outcome.attempts).toBe(3);
+  });
+
+  it('applies default 2xx when only forbidden status rules are set', async () => {
+    globalThis.fetch = vi.fn(
+      async () => new Response('ok', { status: 200 }),
+    ) as unknown as typeof fetch;
+    const ok = await runHttpCheck({
+      ...BASE_CONFIG,
+      forbiddenStatus: [500, { from: 502, to: 504 }],
+    });
+    expect(ok.status).toBe('up');
+    expect(ok.httpStatus).toBe(200);
+
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(
+      async () => new Response('err', { status: 500 }),
+    ) as unknown as typeof fetch;
+    const forbiddenPromise = runHttpCheck({
+      ...BASE_CONFIG,
+      forbiddenStatus: [500],
+    });
+    await vi.advanceTimersByTimeAsync(1_200);
+    const forbidden = await forbiddenPromise;
+    expect(forbidden.status).toBe('down');
+    expect(forbidden.error).toBe('Forbidden HTTP status: 500');
+
+    globalThis.fetch = vi.fn(
+      async () => new Response('missing', { status: 404 }),
+    ) as unknown as typeof fetch;
+    const non2xxPromise = runHttpCheck({
+      ...BASE_CONFIG,
+      forbiddenStatus: [500],
+    });
+    await vi.advanceTimersByTimeAsync(1_200);
+    const non2xx = await non2xxPromise;
+    expect(non2xx.status).toBe('down');
+    expect(non2xx.error).toBe('Unexpected HTTP status: 404');
+  });
+
   it('applies keyword assertions for response bodies', async () => {
     vi.useFakeTimers();
 
-    globalThis.fetch = vi.fn(async () => new Response('all systems nominal', { status: 200 })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(
+      async () => new Response('all systems nominal', { status: 200 }),
+    ) as unknown as typeof fetch;
     const missingPromise = runHttpCheck({ ...BASE_CONFIG, responseKeyword: 'incident' });
     await vi.advanceTimersByTimeAsync(1_200);
     const missing = await missingPromise;
@@ -104,7 +235,9 @@ describe('monitor/http', () => {
     expect(missing.error).toBe('Response keyword not found');
     expect(missing.attempts).toBe(3);
 
-    globalThis.fetch = vi.fn(async () => new Response('contains secret token', { status: 200 })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(
+      async () => new Response('contains secret token', { status: 200 }),
+    ) as unknown as typeof fetch;
     const forbiddenPromise = runHttpCheck({ ...BASE_CONFIG, responseForbiddenKeyword: 'secret' });
     await vi.advanceTimersByTimeAsync(1_200);
     const forbidden = await forbiddenPromise;
@@ -116,7 +249,9 @@ describe('monitor/http', () => {
   it('supports regex assertions for required and forbidden response bodies', async () => {
     vi.useFakeTimers();
 
-    globalThis.fetch = vi.fn(async () => new Response('status=ready version=42', { status: 200 })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(
+      async () => new Response('status=ready version=42', { status: 200 }),
+    ) as unknown as typeof fetch;
     const requiredSuccess = await runHttpCheck({
       ...BASE_CONFIG,
       responseKeyword: 'status=ready\\s+version=\\d+',
@@ -126,7 +261,9 @@ describe('monitor/http', () => {
     expect(requiredSuccess.error).toBeNull();
     expect(requiredSuccess.attempts).toBe(1);
 
-    globalThis.fetch = vi.fn(async () => new Response('status=starting', { status: 200 })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(
+      async () => new Response('status=starting', { status: 200 }),
+    ) as unknown as typeof fetch;
     const requiredFailurePromise = runHttpCheck({
       ...BASE_CONFIG,
       responseKeyword: 'status=ready\\s+version=\\d+',
@@ -138,7 +275,9 @@ describe('monitor/http', () => {
     expect(requiredFailure.error).toBe('Required response regex not matched');
     expect(requiredFailure.attempts).toBe(3);
 
-    globalThis.fetch = vi.fn(async () => new Response('status=ready secret=token-123', { status: 200 })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(
+      async () => new Response('status=ready secret=token-123', { status: 200 }),
+    ) as unknown as typeof fetch;
     const forbiddenFailurePromise = runHttpCheck({
       ...BASE_CONFIG,
       responseForbiddenKeyword: 'secret=token-\\d+',
@@ -152,7 +291,9 @@ describe('monitor/http', () => {
   });
 
   it('returns unknown when body assertions are requested but response has no readable body', async () => {
-    globalThis.fetch = vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(
+      async () => new Response(null, { status: 200 }),
+    ) as unknown as typeof fetch;
 
     const outcome = await runHttpCheck({ ...BASE_CONFIG, responseKeyword: 'ok' });
     expect(outcome.status).toBe('unknown');

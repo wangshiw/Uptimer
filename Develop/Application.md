@@ -145,8 +145,10 @@ graph TD
 - Headers：可配；默认附加 `User-Agent: Uptimer/<version>`。
 - Body：可选（主要用于 POST 探测）。
 - Status code assertion：
-  - 默认：2xx 视为成功（可选包含 3xx）。
-  - 可配置允许码列表（如 `[200,204,301]`）。
+  - 默认：2xx 视为成功。
+  - 可配置允许码/区间（`expected_status_json`，如 `[200,204,{"from":301,"to":399}]`）。
+  - 可配置禁止码/区间（`forbidden_status_json`）；**黑名单优先**于白名单。
+  - 仅配置黑名单时仍默认 2xx，再排除禁止码。
 - Response assertion：
   - `responseKeyword`：必须包含（可选）。
   - `responseForbiddenKeyword`：必须不包含（可选）。
@@ -237,6 +239,20 @@ Cron 建议配置为每分钟触发一次（`* * * * *`），但并不意味着�
 
 可选：记录本轮执行位置（colo/region）用于展示“当前探针位置”与排障（例如通过请求 `https://cloudflare.com/cdn-cgi/trace` 解析 `colo=`）。
 
+### 6.9 Free Plan CPU Profile（当前发布基线）
+
+Issue #24 的最终发布基线针对 Cloudflare Free Plan `10ms CPU` 预算做了专项优化：
+
+- scheduled wrapper 只做轻量编排；实际探测拆为 `POST /api/v1/internal/scheduled/check-batch` 子 invocation。
+- check-batch 在已持有 scheduler lease 且 chunk 唯一时使用 trusted scheduler lease 模式，避免重复 D1 batch/monitor lock 长尾。
+- monitor runtime updates 先收集为 compact updates，再由单个 bulk writer 写入 runtime update fragments。
+- public homepage/status 继续走 D1 静态预计算快照；不以 live compute 作为公共 API 主路径。
+- homepage/status 快照使用 D1 fragments 分片 seed、raw JSON assemble、continuation publish。
+- `homepage:artifact` 的 monitor preload card HTML 在 fragment seed 阶段预渲染，artifact publish 只拼接预渲染 fragments。
+- 正常 scheduled summary logs 默认关闭；warnings/errors 保留。
+
+发布验证证据见 `Develop/Worker-CPU-10ms-Release-Readiness.md`。被拒绝的 `UPTIMER_PUBLIC_SHARDED_HOMEPAGE_RUNTIME_SEED` 不属于发布基线。
+
 ---
 
 ## 7. 数据模型 (D1 Schema Strategy)
@@ -265,7 +281,8 @@ CREATE TABLE IF NOT EXISTS monitors (
   http_method TEXT,
   http_headers_json TEXT,
   http_body TEXT,
-  expected_status_json TEXT, -- e.g. [200,204,301]
+  expected_status_json TEXT, -- e.g. [200,204,{"from":301,"to":399}]
+  forbidden_status_json TEXT, -- e.g. [204,{"from":500,"to":599}]; blacklist first
   response_keyword TEXT,
   response_forbidden_keyword TEXT,
 
@@ -398,6 +415,34 @@ CREATE TABLE IF NOT EXISTS locks (
   name TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+-- 公共 API 静态快照（homepage/status/homepage:artifact fast path）
+CREATE TABLE IF NOT EXISTS public_snapshots (
+  key TEXT PRIMARY KEY,
+  generated_at INTEGER NOT NULL,
+  body_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
+
+-- 公共快照 guard state/version（跨 Worker isolate 证明 fast guard 状态仍当前）
+CREATE TABLE IF NOT EXISTS public_snapshot_guard_versions (
+  key TEXT PRIMARY KEY,
+  version INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  state_json TEXT
+);
+
+-- 公共快照 fragments（D1-first 分片 seed/assemble/publish）
+CREATE TABLE IF NOT EXISTS public_snapshot_fragments (
+  snapshot_key TEXT NOT NULL,
+  fragment_key TEXT NOT NULL,
+  generated_at INTEGER NOT NULL,
+  body_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (snapshot_key, fragment_key)
+);
+CREATE INDEX IF NOT EXISTS idx_public_snapshot_fragments_snapshot_generated
+  ON public_snapshot_fragments(snapshot_key, generated_at);
 ```
 
 ### 7.2 数据保留与清理 (Retention)
@@ -452,10 +497,13 @@ Uptime / SLA（按时间窗口计算可用性）：
 
 Public:
 
-- `GET /api/v1/public/status`：返回全局状态、组件列表、未解决事件摘要、最近心跳与延迟（用于状态页首屏）。
+- `GET /api/v1/public/homepage`：公共首页 JSON；优先读取 `public_snapshots.homepage` / fragments 发布结果。
+- `GET /api/v1/public/homepage-artifact`：Pages HTML preload artifact；返回 `preload_html` + `snapshot`。
+- `GET /api/v1/public/status`：返回全局状态、组件列表、未解决事件摘要、维护窗口、最近心跳与延迟（状态页首屏）。
 - `GET /api/v1/public/monitors/:id/latency?range=24h`：延迟序列（对外可限制粒度）。
 - `GET /api/v1/public/monitors/:id/uptime?range=24h|7d|30d`：SLA/可用性统计（含 downtime 秒数与 Unknown 比例）。
 - `GET /api/v1/public/incidents?limit=20`：历史事件列表。
+- `GET /api/v1/public/maintenance-windows?limit=20`：公开维护窗口列表。
 
 Admin:
 
@@ -481,6 +529,15 @@ Admin:
 - `PATCH /api/v1/admin/notification-channels/:id`
 - `DELETE /api/v1/admin/notification-channels/:id`
 - `POST /api/v1/admin/notification-channels/:id/test`
+
+Internal（Bearer Token + feature flags；scheduled/service-binding 使用，不作为公共产品 API）：
+
+- `POST /api/v1/internal/scheduled/check-batch`
+- `POST /api/v1/internal/write/runtime-update-fragments`
+- `POST /api/v1/internal/refresh/runtime-fragments`
+- `POST /api/v1/internal/seed/sharded-public-snapshot`
+- `POST /api/v1/internal/assemble/sharded-public-snapshot`
+- `POST /api/v1/internal/continue/sharded-public-snapshot`
 
 ### 8.4 分页与过滤
 
@@ -528,6 +585,7 @@ Webhook Channel `config_json`（建议字段）：
 
 ```json
 {
+  "preset": "custom",
   "url": "https://example.com/webhook",
   "method": "POST",
   "headers": { "Authorization": "Bearer xxx" },
@@ -546,6 +604,40 @@ Webhook Channel `config_json`（建议字段）：
   - `X-Uptimer-Timestamp: <unix seconds>`
   - `X-Uptimer-Signature: sha256=<hmac>`（对 `timestamp + "." + rawBody` 做 HMAC-SHA256）
 - 目的：让接收方可验证来源与防重放（接收方校验 timestamp 在允许窗口内）。
+
+Telegram Channel `config_json`（内置 preset）：
+
+默认 Admin API 输入：
+
+```json
+{
+  "preset": "telegram",
+  "bot_token": "123456789:AA...",
+  "chat_id": "@status_channel"
+}
+```
+
+D1 存储形态：
+
+```json
+{
+  "preset": "telegram",
+  "bot_token_encrypted": "v1:...",
+  "chat_id": "@status_channel",
+  "message_thread_id": 123,
+  "timeout_ms": 5000,
+  "message_template": "{{message}}",
+  "enabled_events": ["monitor.down", "monitor.up"],
+  "parse_mode": "HTML",
+  "disable_notification": false,
+  "protect_content": false
+}
+```
+
+- Telegram 告警是 Uptimer 向 Telegram Bot API 出站调用 `sendMessage`，不是 Telegram `setWebhook` 入站更新回调。
+- 默认路径允许管理员在 UI/API 输入 Bot Token；Worker 使用现有 `ADMIN_TOKEN` 派生密钥加密后，仅把 `bot_token_encrypted` 写入 D1。Admin API 响应不得回传明文或密文 token。
+- 轮换 `ADMIN_TOKEN` 后，已加密的 Telegram token 需要在后台重新保存。
+- 进阶路径仍支持 `bot_token_secret_ref`，只保存 Workers Secret binding 名称；适合希望在 D1 之外管理 Bot Token 的部署。
 
 ### 9.3 去重与重试
 
@@ -636,16 +728,45 @@ Webhook Channel `config_json`（建议字段）：
 ```toml
 name = "uptimer"
 main = "src/index.ts"
-compatibility_date = "2025-04-02"
+compatibility_date = "2026-01-28"
+minify = true
 
 [triggers]
-crons = ["* * * * *"] # 每分钟
+crons = ["* * * * *", "0 0 * * *", "30 0 * * *"]
 
 [[d1_databases]]
 binding = "DB"
 database_name = "uptimer"
 database_id = "<uuid>"
+
+[vars]
+ADMIN_RATE_LIMIT_MAX = "60"
+ADMIN_RATE_LIMIT_WINDOW_SEC = "60"
+UPTIMER_SCHEDULED_STATUS_REFRESH = "1"
+UPTIMER_TRUST_SCHEDULED_RUNTIME_UPDATES = "1"
+UPTIMER_INTERNAL_SCHEDULED_BATCH_SIZE = "2"
+# Free Plan CPU profile: see Develop/Worker-CPU-10ms-Release-Readiness.md
+UPTIMER_PUBLIC_MONITOR_UPDATE_FRAGMENT_WRITES = "1"
+UPTIMER_SCHEDULED_RUNTIME_FRAGMENT_REFRESH = "1"
+UPTIMER_PUBLIC_SHARDED_FRAGMENT_SEED = "1"
+UPTIMER_SCHEDULED_SHARDED_FRAGMENT_SEED = "1"
+UPTIMER_PUBLIC_SHARDED_ASSEMBLER = "1"
+UPTIMER_SCHEDULED_SHARDED_ASSEMBLER = "1"
+UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH = "1"
+UPTIMER_SCHEDULED_SHARDED_PUBLISH = "1"
+UPTIMER_PUBLIC_HOMEPAGE_ARTIFACT_FRAGMENT_WRITES = "1"
+UPTIMER_SHARDED_ASSEMBLER_MODE = "json"
+UPTIMER_SCHEDULED_SHARDED_SKIP_HOMEPAGE_REFRESH = "1"
+UPTIMER_SCHEDULED_SHARDED_CONTINUATION = "1"
+UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE = "4"
+UPTIMER_SHARDED_RUNTIME_UPDATE_BATCH_SIZE = "5"
+UPTIMER_INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS = "75000"
+UPTIMER_INTERNAL_CHECK_BATCH_FRAGMENT_WRITE_SPLIT = "1"
+UPTIMER_INTERNAL_CHECK_BATCH_TRUST_SCHEDULER_LEASE = "1"
+UPTIMER_SCHEDULED_REFRESH_LOGS = "0"
 ```
+
+`UPTIMER_PUBLIC_SHARDED_HOMEPAGE_RUNTIME_SEED` 曾实测产生 continuation CPU outliers，不属于发布基线。
 
 ---
 

@@ -1,3 +1,5 @@
+import { evaluateHttpStatusCode, type StatusCodeRule } from '@uptimer/db';
+
 import {
   evaluateHttpResponseAssertions,
   prepareHttpResponseAssertions,
@@ -13,7 +15,9 @@ export type HttpCheckConfig = {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
   headers: Record<string, string> | null;
   body: string | null;
-  expectedStatus: number[] | null;
+  followRedirects: boolean;
+  expectedStatus: StatusCodeRule[] | null;
+  forbiddenStatus: StatusCodeRule[] | null;
   responseKeyword: string | null;
   responseKeywordMode: HttpResponseMatchMode | null;
   responseForbiddenKeyword: string | null;
@@ -45,6 +49,16 @@ async function fetchWithTimeout(
   timeoutMs: number,
   init: RequestInit,
 ): Promise<Response> {
+  // Prefer AbortSignal.timeout when available (avoids setTimeout + event listener overhead).
+  const timeoutFn = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout;
+  const isWorkersRuntime =
+    typeof navigator !== 'undefined' &&
+    typeof navigator.userAgent === 'string' &&
+    navigator.userAgent === 'Cloudflare-Workers';
+  if (isWorkersRuntime && !init.signal && typeof timeoutFn === 'function') {
+    return fetch(url, { ...init, signal: timeoutFn(timeoutMs) });
+  }
+
   const controller = new AbortController();
 
   // If the caller also passes a signal, forward abort.
@@ -105,13 +119,6 @@ async function readTextUpTo(
   return { text, truncated };
 }
 
-function statusOk(httpStatus: number, expectedStatus: number[] | null): boolean {
-  if (expectedStatus && expectedStatus.length > 0) {
-    return expectedStatus.includes(httpStatus);
-  }
-  return httpStatus >= 200 && httpStatus < 300;
-}
-
 async function attemptHttpCheck(
   config: HttpCheckConfig,
   assertions: PreparedHttpResponseAssertion[],
@@ -127,6 +134,7 @@ async function attemptHttpCheck(
     const init: RequestInit = {
       method: config.method,
       headers,
+      redirect: config.followRedirects ? 'follow' : 'manual',
       cache: 'no-store',
       cf: {
         cacheTtlByStatus: { '100-599': -1 },
@@ -142,13 +150,20 @@ async function attemptHttpCheck(
     const latencyMs = Math.round(performance.now() - started);
     const httpStatus = res.status;
 
-    if (!statusOk(httpStatus, config.expectedStatus)) {
+    const statusEval = evaluateHttpStatusCode(httpStatus, {
+      expected: config.expectedStatus,
+      forbidden: config.forbiddenStatus,
+    });
+    if (!statusEval.ok) {
       res.body?.cancel();
       return {
         status: 'down',
         latencyMs,
         httpStatus,
-        error: `Unexpected HTTP status: ${httpStatus}`,
+        error:
+          statusEval.reason === 'forbidden'
+            ? `Forbidden HTTP status: ${httpStatus}`
+            : `Unexpected HTTP status: ${httpStatus}`,
       };
     }
 

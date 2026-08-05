@@ -29,7 +29,7 @@
 
 **监控**
 
-- HTTP(S) 探测，支持自定义 Headers、Body、状态码与关键词断言
+- HTTP(S) 探测，支持自定义 Headers、Body、状态码白名单/黑名单（精确码与区间）与关键词断言
 - TCP 端口连通性检测
 - 可配置的超时、重试阈值与抖动控制
 - 自动状态机：UP / DOWN / MAINTENANCE / PAUSED / UNKNOWN
@@ -218,5 +218,7 @@ pnpm format:check  # Prettier 格式检查
 <div align="center">
 
 基于 [Cloudflare Workers](https://workers.cloudflare.com/) + [Hono](https://hono.dev/) + [React](https://react.dev/) 构建
+
+感谢 [UptimeFlare](https://github.com/lyc8503/UptimeFlare) 在 Cloudflare 原生可用性监控模式上带来的启发。
 
 </div>

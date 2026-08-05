@@ -57,10 +57,13 @@ const homepageUptimeDayStripSchema = z.object({
   uptime_pct_milli: z.array(z.number().int().min(0).max(100_000).nullable()),
 });
 
+const displayUrlSchema = z.string().url().nullable().catch(null);
+
 export const homepageMonitorCardSchema = z.object({
   id: z.number().int().positive(),
   name: z.string(),
   type: z.enum(['http', 'tcp']),
+  display_url: displayUrlSchema,
   group_name: z.string().min(1).nullable(),
   status: monitorStatusSchema,
   is_stale: z.boolean(),
@@ -117,5 +120,55 @@ export const publicHomepageResponseSchema = z.object({
   maintenance_history_preview: maintenanceWindowPreviewSchema.nullable(),
 });
 
+export const storedPublicHomepageResponseSchema = z.object({
+  generated_at: z.number().int().nonnegative(),
+  bootstrap_mode: z.enum(['full', 'partial']),
+  monitor_count_total: z.number().int().nonnegative(),
+  site_title: z.string(),
+  site_description: z.string(),
+  site_locale: z.enum(['auto', 'en', 'zh-CN', 'zh-TW', 'ja', 'es']),
+  site_timezone: z.string(),
+  uptime_rating_level: uptimeRatingLevelSchema,
+  overall_status: monitorStatusSchema,
+  banner: bannerSchema,
+  summary: z.object({
+    up: z.number().int().nonnegative(),
+    down: z.number().int().nonnegative(),
+    maintenance: z.number().int().nonnegative(),
+    paused: z.number().int().nonnegative(),
+    unknown: z.number().int().nonnegative(),
+  }),
+  monitors: z.array(homepageMonitorCardSchema),
+  active_incidents: z.array(incidentSummarySchema),
+  maintenance_windows: z.object({
+    active: z.array(maintenanceWindowPreviewSchema),
+    upcoming: z.array(maintenanceWindowPreviewSchema),
+  }),
+  resolved_incident_preview: incidentSummarySchema.nullable(),
+  maintenance_history_preview: maintenanceWindowPreviewSchema.nullable(),
+});
+
+const publicHomepageRenderArtifactBaseSchema = z.object({
+  generated_at: z.number().int().nonnegative(),
+  preload_html: z.string(),
+  meta_title: z.string(),
+  meta_description: z.string(),
+});
+
+export const publicHomepageRenderArtifactSchema = publicHomepageRenderArtifactBaseSchema.extend({
+  snapshot: publicHomepageResponseSchema,
+});
+
+export const publicHomepageStoredRenderArtifactSchema = z.union([
+  publicHomepageRenderArtifactSchema,
+  publicHomepageRenderArtifactBaseSchema.extend({
+    snapshot_json: z.string().min(1),
+  }),
+]);
+
 export type PublicHomepageResponse = z.infer<typeof publicHomepageResponseSchema>;
 export type HomepageMonitorCard = z.infer<typeof homepageMonitorCardSchema>;
+export type PublicHomepageRenderArtifact = z.infer<typeof publicHomepageRenderArtifactSchema>;
+export type StoredPublicHomepageRenderArtifact = z.infer<
+  typeof publicHomepageStoredRenderArtifactSchema
+>;

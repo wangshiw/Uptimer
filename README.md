@@ -29,7 +29,7 @@ English | **[中文](README.zh-CN.md)**
 
 **Monitoring**
 
-- HTTP(S) probes with custom headers, body, status code & keyword assertions
+- HTTP(S) probes with custom headers, body, status code allow/deny lists (exact codes & ranges) & keyword assertions
 - TCP port connectivity checks
 - Configurable timeouts, retry thresholds, and flapping control
 - Automatic state machine: UP / DOWN / MAINTENANCE / PAUSED / UNKNOWN
@@ -218,5 +218,7 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 <div align="center">
 
 Built with [Cloudflare Workers](https://workers.cloudflare.com/) + [Hono](https://hono.dev/) + [React](https://react.dev/)
+
+Thanks to [UptimeFlare](https://github.com/lyc8503/UptimeFlare) for inspiration on Cloudflare-native uptime monitoring patterns.
 
 </div>

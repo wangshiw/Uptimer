@@ -4,6 +4,8 @@ export type MonitorStatus = 'up' | 'down' | 'maintenance' | 'paused' | 'unknown'
 export type CheckStatus = 'up' | 'down' | 'maintenance' | 'unknown';
 export type MonitorType = 'http' | 'tcp';
 export type HttpResponseMatchMode = 'contains' | 'regex';
+/** Exact code or inclusive range (100-599). Matches worker/DB status rule JSON. */
+export type StatusCodeRule = number | { from: number; to: number };
 export type SupportedLocale = 'en' | 'zh-CN' | 'zh-TW' | 'ja' | 'es';
 export type LocaleSetting = 'auto' | SupportedLocale;
 export type HomepageBootstrapMode = 'full' | 'partial';
@@ -106,6 +108,7 @@ export interface PublicMonitor {
   id: number;
   name: string;
   type: MonitorType;
+  display_url: string | null;
   group_name: string | null;
   group_sort_order: number;
   sort_order: number;
@@ -175,6 +178,7 @@ export interface HomepageMonitorCard {
   id: number;
   name: string;
   type: MonitorType;
+  display_url: string | null;
   group_name: string | null;
   status: MonitorStatus;
   is_stale: boolean;
@@ -343,6 +347,7 @@ export interface AdminMonitor {
   name: string;
   type: MonitorType;
   target: string;
+  display_url: string | null;
   group_name: string | null;
   group_sort_order: number;
   sort_order: number;
@@ -352,7 +357,9 @@ export interface AdminMonitor {
   http_method: string | null;
   http_headers_json: Record<string, string> | null;
   http_body: string | null;
-  expected_status_json: number[] | null;
+  follow_redirects: boolean;
+  expected_status_json: StatusCodeRule[] | null;
+  forbidden_status_json: StatusCodeRule[] | null;
   response_keyword: string | null;
   response_keyword_mode: HttpResponseMatchMode | null;
   response_forbidden_keyword: string | null;
@@ -372,6 +379,7 @@ export interface CreateMonitorInput {
   name: string;
   type: MonitorType;
   target: string;
+  display_url?: string | null;
   group_name?: string;
   group_sort_order?: number;
   sort_order?: number;
@@ -381,7 +389,9 @@ export interface CreateMonitorInput {
   http_method?: string;
   http_headers_json?: Record<string, string>;
   http_body?: string;
-  expected_status_json?: number[];
+  follow_redirects?: boolean;
+  expected_status_json?: StatusCodeRule[];
+  forbidden_status_json?: StatusCodeRule[];
   response_keyword?: string;
   response_keyword_mode?: HttpResponseMatchMode;
   response_forbidden_keyword?: string;
@@ -392,6 +402,7 @@ export interface CreateMonitorInput {
 export interface PatchMonitorInput {
   name?: string;
   target?: string;
+  display_url?: string | null;
   group_name?: string | null;
   group_sort_order?: number;
   sort_order?: number;
@@ -401,7 +412,9 @@ export interface PatchMonitorInput {
   http_method?: string;
   http_headers_json?: Record<string, string> | null;
   http_body?: string | null;
-  expected_status_json?: number[] | null;
+  follow_redirects?: boolean;
+  expected_status_json?: StatusCodeRule[] | null;
+  forbidden_status_json?: StatusCodeRule[] | null;
   response_keyword?: string | null;
   response_keyword_mode?: HttpResponseMatchMode | null;
   response_forbidden_keyword?: string | null;
@@ -444,7 +457,11 @@ export interface MonitorTestResult {
   };
 }
 
-export interface WebhookChannelConfig {
+export type NotificationChannelPreset = 'custom' | 'telegram';
+export type TelegramParseMode = 'Markdown' | 'MarkdownV2' | 'HTML';
+
+export interface CustomWebhookChannelConfig {
+  preset?: 'custom';
   url: string;
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
   headers?: Record<string, string>;
@@ -467,6 +484,24 @@ export interface WebhookChannelConfig {
     secret_ref: string;
   };
 }
+
+export interface TelegramChannelConfig {
+  preset: 'telegram';
+  bot_token?: string;
+  bot_token_secret_ref?: string;
+  bot_token_configured?: boolean;
+  bot_token_source?: 'stored' | 'secret_ref';
+  chat_id: string;
+  message_thread_id?: number;
+  timeout_ms?: number;
+  message_template?: string;
+  enabled_events?: CustomWebhookChannelConfig['enabled_events'];
+  parse_mode?: TelegramParseMode;
+  disable_notification?: boolean;
+  protect_content?: boolean;
+}
+
+export type WebhookChannelConfig = CustomWebhookChannelConfig | TelegramChannelConfig;
 
 export interface NotificationChannel {
   id: number;

@@ -6,6 +6,7 @@ import type {
   HttpResponseMatchMode,
   MonitorType,
   PatchMonitorInput,
+  StatusCodeRule,
 } from '../api/types';
 import { useI18n } from '../app/I18nContext';
 import {
@@ -76,12 +77,116 @@ function hasAdvancedHttpConfig(monitor: AdminMonitor | undefined): boolean {
   const hasHeaders =
     !!monitor.http_headers_json && Object.keys(monitor.http_headers_json).length > 0;
   const hasExpected = !!monitor.expected_status_json && monitor.expected_status_json.length > 0;
+  const hasForbiddenStatus =
+    !!monitor.forbidden_status_json && monitor.forbidden_status_json.length > 0;
   const hasBody = !!monitor.http_body && monitor.http_body.trim().length > 0;
+  const hasRedirectOverride = monitor.follow_redirects === false;
   const hasKw = !!monitor.response_keyword && monitor.response_keyword.trim().length > 0;
   const hasForbiddenKw =
     !!monitor.response_forbidden_keyword && monitor.response_forbidden_keyword.trim().length > 0;
 
-  return hasHeaders || hasExpected || hasBody || hasKw || hasForbiddenKw;
+  return (
+    hasHeaders ||
+    hasExpected ||
+    hasForbiddenStatus ||
+    hasBody ||
+    hasRedirectOverride ||
+    hasKw ||
+    hasForbiddenKw
+  );
+}
+
+function formatStatusRules(rules: StatusCodeRule[] | null | undefined): string {
+  if (!rules || rules.length === 0) return '';
+  return rules
+    .map((rule) => (typeof rule === 'number' ? String(rule) : `${rule.from}-${rule.to}`))
+    .join(', ');
+}
+
+function parseStatusCodeRuleToken(
+  token: string,
+  t: TranslateFn,
+): { ok: true; value: StatusCodeRule } | { ok: false; error: string } {
+  const trimmed = token.trim();
+  if (!trimmed) {
+    return { ok: false as const, error: t('monitor_form.error_status_rule_empty') };
+  }
+
+  const rangeMatch = /^(\d{3})-(\d{3})$/.exec(trimmed);
+  if (rangeMatch) {
+    const from = Number.parseInt(rangeMatch[1]!, 10);
+    const to = Number.parseInt(rangeMatch[2]!, 10);
+    if (from < 100 || from > 599 || to < 100 || to > 599) {
+      return {
+        ok: false as const,
+        error: t('monitor_form.error_status_rule_invalid', { value: trimmed }),
+      };
+    }
+    if (from > to) {
+      return {
+        ok: false as const,
+        error: t('monitor_form.error_status_rule_range_order', { value: trimmed }),
+      };
+    }
+    return { ok: true as const, value: { from, to } };
+  }
+
+  if (!/^\d{3}$/.test(trimmed)) {
+    return {
+      ok: false as const,
+      error: t('monitor_form.error_status_rule_invalid', { value: trimmed }),
+    };
+  }
+
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(n) || n < 100 || n > 599) {
+    return {
+      ok: false as const,
+      error: t('monitor_form.error_status_rule_invalid', { value: trimmed }),
+    };
+  }
+
+  return { ok: true as const, value: n };
+}
+
+function parseStatusRuleFromJsonItem(
+  item: unknown,
+  t: TranslateFn,
+): { ok: true; value: StatusCodeRule } | { ok: false; error: string } {
+  if (typeof item === 'number' && Number.isInteger(item) && item >= 100 && item <= 599) {
+    return { ok: true as const, value: item };
+  }
+
+  if (item && typeof item === 'object' && !Array.isArray(item)) {
+    const rec = item as Record<string, unknown>;
+    const from = rec.from;
+    const to = rec.to;
+    if (
+      typeof from === 'number' &&
+      typeof to === 'number' &&
+      Number.isInteger(from) &&
+      Number.isInteger(to) &&
+      from >= 100 &&
+      from <= 599 &&
+      to >= 100 &&
+      to <= 599
+    ) {
+      if (from > to) {
+        return {
+          ok: false as const,
+          error: t('monitor_form.error_status_rule_range_order', {
+            value: `${from}-${to}`,
+          }),
+        };
+      }
+      return { ok: true as const, value: { from, to } };
+    }
+  }
+
+  return {
+    ok: false as const,
+    error: t('monitor_form.error_status_rule_invalid', { value: String(item) }),
+  };
 }
 
 function parseHeadersJson(
@@ -114,34 +219,24 @@ function parseHeadersJson(
   return { ok: true as const, value: parsed as Record<string, string> };
 }
 
-function parseExpectedStatusInput(
+function parseStatusRulesInput(
   text: string,
   t: TranslateFn,
-): { ok: true; value: number[] | null } | { ok: false; error: string } {
+): { ok: true; value: StatusCodeRule[] | null } | { ok: false; error: string } {
   const trimmed = text.trim();
   if (!trimmed) return { ok: true as const, value: null };
 
-  const parseList = (parts: string[]) => {
-    if (parts.length === 0) {
-      return { ok: false as const, error: t('monitor_form.error_expected_status_empty') };
+  const finalize = (rules: StatusCodeRule[]) => {
+    if (rules.length === 0) {
+      return { ok: false as const, error: t('monitor_form.error_status_rules_empty') };
     }
-
-    const out: number[] = [];
-    for (const p of parts) {
-      const n = Number.parseInt(p, 10);
-      if (!Number.isFinite(n) || n < 100 || n > 599) {
-        return {
-          ok: false as const,
-          error: t('monitor_form.error_expected_status_invalid', { value: p }),
-        };
-      }
-      out.push(n);
+    if (rules.length > 50) {
+      return { ok: false as const, error: t('monitor_form.error_status_rules_too_many') };
     }
-
-    return { ok: true as const, value: out };
+    return { ok: true as const, value: rules };
   };
 
-  // Also accept JSON array input like: [200, 204]
+  // Also accept JSON array input like: [200, 204, {"from":301,"to":399}]
   if (trimmed.startsWith('[')) {
     let parsed: unknown;
     try {
@@ -149,16 +244,21 @@ function parseExpectedStatusInput(
     } catch {
       return {
         ok: false as const,
-        error: t('monitor_form.error_expected_status_json_or_list'),
+        error: t('monitor_form.error_status_rules_json_or_list'),
       };
     }
 
     if (!Array.isArray(parsed)) {
-      return { ok: false as const, error: t('monitor_form.error_expected_status_must_array') };
+      return { ok: false as const, error: t('monitor_form.error_status_rules_must_array') };
     }
 
-    const parts = parsed.map((x) => String(x));
-    return parseList(parts);
+    const out: StatusCodeRule[] = [];
+    for (const item of parsed) {
+      const r = parseStatusRuleFromJsonItem(item, t);
+      if (!r.ok) return r;
+      out.push(r.value);
+    }
+    return finalize(out);
   }
 
   const parts = trimmed
@@ -166,7 +266,14 @@ function parseExpectedStatusInput(
     .map((p) => p.trim())
     .filter(Boolean);
 
-  return parseList(parts);
+  const out: StatusCodeRule[] = [];
+  for (const p of parts) {
+    const r = parseStatusCodeRuleToken(p, t);
+    if (!r.ok) return r;
+    out.push(r.value);
+  }
+
+  return finalize(out);
 }
 
 function parseOptionalSortOrderInput(
@@ -180,6 +287,24 @@ function parseOptionalSortOrderInput(
   if (!Number.isFinite(n) || n < -100000 || n > 100000) return { ok: false };
 
   return { ok: true, value: n };
+}
+
+function parseOptionalDisplayUrlInput(
+  text: string,
+  t: TranslateFn,
+): { ok: true; value: string | null } | { ok: false; error: string } {
+  const trimmed = text.trim();
+  if (!trimmed) return { ok: true, value: null };
+
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return { ok: false, error: t('monitor_form.error_display_url_protocol') };
+    }
+    return { ok: true, value: trimmed };
+  } catch {
+    return { ok: false, error: t('monitor_form.error_display_url_invalid') };
+  }
 }
 
 function parseRegexPatternInput(
@@ -227,6 +352,7 @@ export function MonitorForm(props: CreateProps | EditProps) {
   const [showOnStatusPage, setShowOnStatusPage] = useState(monitor?.show_on_status_page ?? true);
   const [type, setType] = useState<MonitorType>(monitor?.type ?? 'http');
   const [target, setTarget] = useState(monitor?.target ?? '');
+  const [displayUrl, setDisplayUrl] = useState(monitor?.display_url ?? '');
   const [intervalSec, setIntervalSec] = useState(monitor?.interval_sec ?? 60);
   const [timeoutMs, setTimeoutMs] = useState(monitor?.timeout_ms ?? 10000);
 
@@ -247,18 +373,27 @@ export function MonitorForm(props: CreateProps | EditProps) {
 
   const [expectedStatusInput, setExpectedStatusInput] = useState(() => {
     if (!monitor || monitor.type !== 'http') return '';
-    if (!monitor.expected_status_json || monitor.expected_status_json.length === 0) return '';
-    return monitor.expected_status_json.join(', ');
+    return formatStatusRules(monitor.expected_status_json);
+  });
+
+  const [forbiddenStatusInput, setForbiddenStatusInput] = useState(() => {
+    if (!monitor || monitor.type !== 'http') return '';
+    return formatStatusRules(monitor.forbidden_status_json);
   });
 
   const [httpBody, setHttpBody] = useState(() =>
     monitor?.type === 'http' ? (monitor.http_body ?? '') : '',
   );
+  const [followRedirects, setFollowRedirects] = useState(() =>
+    monitor?.type === 'http' ? monitor.follow_redirects : true,
+  );
   const [responseKeyword, setResponseKeyword] = useState(() =>
     monitor?.type === 'http' ? (monitor.response_keyword ?? '') : '',
   );
   const [responseKeywordMode, setResponseKeywordMode] = useState<HttpResponseMatchMode>(() =>
-    monitor?.type === 'http' ? normalizeHttpResponseMatchMode(monitor.response_keyword_mode) : 'contains',
+    monitor?.type === 'http'
+      ? normalizeHttpResponseMatchMode(monitor.response_keyword_mode)
+      : 'contains',
   );
   const [responseForbiddenKeyword, setResponseForbiddenKeyword] = useState(() =>
     monitor?.type === 'http' ? (monitor.response_forbidden_keyword ?? '') : '',
@@ -271,9 +406,17 @@ export function MonitorForm(props: CreateProps | EditProps) {
     );
 
   const headersParse = useMemo(() => parseHeadersJson(httpHeadersJson, t), [httpHeadersJson, t]);
+  const displayUrlParse = useMemo(
+    () => parseOptionalDisplayUrlInput(displayUrl, t),
+    [displayUrl, t],
+  );
   const expectedStatusParse = useMemo(
-    () => parseExpectedStatusInput(expectedStatusInput, t),
+    () => parseStatusRulesInput(expectedStatusInput, t),
     [expectedStatusInput, t],
+  );
+  const forbiddenStatusParse = useMemo(
+    () => parseStatusRulesInput(forbiddenStatusInput, t),
+    [forbiddenStatusInput, t],
   );
   const responseKeywordRegexParse = useMemo(
     () => parseRegexPatternInput(responseKeyword, responseKeywordMode, t),
@@ -291,11 +434,13 @@ export function MonitorForm(props: CreateProps | EditProps) {
   const canSubmit =
     name.trim().length > 0 &&
     target.trim().length > 0 &&
+    displayUrlParse.ok &&
     groupSortOrderParse.ok &&
     (type !== 'http' ||
       !showAdvancedHttp ||
       (headersParse.ok &&
         expectedStatusParse.ok &&
+        forbiddenStatusParse.ok &&
         responseKeywordRegexParse.ok &&
         responseForbiddenKeywordRegexParse.ok));
 
@@ -311,6 +456,7 @@ export function MonitorForm(props: CreateProps | EditProps) {
       show_on_status_page: showOnStatusPage,
       interval_sec: intervalSec,
       timeout_ms: timeoutMs,
+      display_url: displayUrlParse.ok ? displayUrlParse.value : null,
     };
 
     if (monitor) {
@@ -318,7 +464,11 @@ export function MonitorForm(props: CreateProps | EditProps) {
         ...base,
         group_name: normalizedGroupName.length > 0 ? normalizedGroupName : null,
       };
-      if (groupSortOrderTouched && groupSortOrderParse.ok && groupSortOrderParse.value !== undefined) {
+      if (
+        groupSortOrderTouched &&
+        groupSortOrderParse.ok &&
+        groupSortOrderParse.value !== undefined
+      ) {
         data.group_sort_order = groupSortOrderParse.value;
       }
 
@@ -326,6 +476,8 @@ export function MonitorForm(props: CreateProps | EditProps) {
         data.http_method = httpMethod;
 
         if (showAdvancedHttp) {
+          data.follow_redirects = followRedirects;
+
           if (headersParse.ok) {
             data.http_headers_json =
               Object.keys(headersParse.value).length > 0 ? headersParse.value : null;
@@ -333,6 +485,10 @@ export function MonitorForm(props: CreateProps | EditProps) {
 
           if (expectedStatusParse.ok) {
             data.expected_status_json = expectedStatusParse.value;
+          }
+
+          if (forbiddenStatusParse.ok) {
+            data.forbidden_status_json = forbiddenStatusParse.value;
           }
 
           data.http_body = httpBody.trim().length > 0 ? httpBody : null;
@@ -347,7 +503,9 @@ export function MonitorForm(props: CreateProps | EditProps) {
           // In edit mode, hiding advanced options means reset all persisted advanced HTTP settings.
           data.http_headers_json = null;
           data.expected_status_json = null;
+          data.forbidden_status_json = null;
           data.http_body = null;
+          data.follow_redirects = true;
           data.response_keyword = null;
           data.response_keyword_mode = null;
           data.response_forbidden_keyword = null;
@@ -369,12 +527,18 @@ export function MonitorForm(props: CreateProps | EditProps) {
       data.http_method = httpMethod;
 
       if (showAdvancedHttp) {
+        data.follow_redirects = followRedirects;
+
         if (headersParse.ok && Object.keys(headersParse.value).length > 0) {
           data.http_headers_json = headersParse.value;
         }
 
         if (expectedStatusParse.ok && expectedStatusParse.value !== null) {
           data.expected_status_json = expectedStatusParse.value;
+        }
+
+        if (forbiddenStatusParse.ok && forbiddenStatusParse.value !== null) {
+          data.forbidden_status_json = forbiddenStatusParse.value;
         }
 
         if (httpBody.trim().length > 0) {
@@ -522,6 +686,21 @@ export function MonitorForm(props: CreateProps | EditProps) {
         />
       </div>
 
+      <div>
+        <label className={labelClass}>{t('monitor_form.display_url_optional')}</label>
+        <input
+          type="url"
+          value={displayUrl}
+          onChange={(e) => setDisplayUrl(e.target.value)}
+          placeholder={t('monitor_form.display_url_placeholder')}
+          className={inputClass}
+        />
+        {!displayUrlParse.ok && (
+          <div className="mt-1 text-xs text-red-600 dark:text-red-400">{displayUrlParse.error}</div>
+        )}
+        <div className={FIELD_HELP_CLASS}>{t('monitor_form.display_url_help')}</div>
+      </div>
+
       {type === 'http' && (
         <div>
           <label className={labelClass}>{t('monitor_form.method')}</label>
@@ -576,6 +755,23 @@ export function MonitorForm(props: CreateProps | EditProps) {
 
           {showAdvancedHttp && (
             <div className="mt-4 space-y-4">
+              <label className="flex items-start gap-3 text-sm text-slate-700 dark:text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={followRedirects}
+                  onChange={(e) => setFollowRedirects(e.target.checked)}
+                  className="mt-1"
+                />
+                <span>
+                  <span className="font-medium text-slate-900 dark:text-slate-100">
+                    {t('monitor_form.follow_redirects')}
+                  </span>
+                  <span className={`mt-1 block ${FIELD_HELP_CLASS}`}>
+                    {t('monitor_form.follow_redirects_help')}
+                  </span>
+                </span>
+              </label>
+
               <div>
                 <label className={labelClass}>{t('monitor_form.headers_optional')}</label>
                 <textarea
@@ -608,6 +804,23 @@ export function MonitorForm(props: CreateProps | EditProps) {
                   </div>
                 )}
                 <div className={FIELD_HELP_CLASS}>{t('monitor_form.expected_status_help')}</div>
+              </div>
+
+              <div>
+                <label className={labelClass}>{t('monitor_form.forbidden_status_optional')}</label>
+                <input
+                  type="text"
+                  value={forbiddenStatusInput}
+                  onChange={(e) => setForbiddenStatusInput(e.target.value)}
+                  className={inputClass}
+                  placeholder={t('monitor_form.forbidden_status_placeholder')}
+                />
+                {!forbiddenStatusParse.ok && (
+                  <div className="mt-1 text-xs text-red-600 dark:text-red-400">
+                    {forbiddenStatusParse.error}
+                  </div>
+                )}
+                <div className={FIELD_HELP_CLASS}>{t('monitor_form.forbidden_status_help')}</div>
               </div>
 
               <div>
@@ -650,7 +863,9 @@ export function MonitorForm(props: CreateProps | EditProps) {
                   <label className={labelClass}>{t('monitor_form.match_mode')}</label>
                   <select
                     value={responseKeywordMode}
-                    onChange={(e) => setResponseKeywordMode(e.target.value as HttpResponseMatchMode)}
+                    onChange={(e) =>
+                      setResponseKeywordMode(e.target.value as HttpResponseMatchMode)
+                    }
                     className={selectClass}
                   >
                     <option value="contains">{t('monitor_form.match_mode_contains')}</option>

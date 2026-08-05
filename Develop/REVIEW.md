@@ -8,7 +8,7 @@ The following are implemented and deployed:
 
 - Worker: Hono + Zod API (`/api/v1/public/*`, `/api/v1/admin/*`), scheduled monitor engine, retention, daily rollups
 - Storage: D1 schema + migrations (monitors/state/results/outages/incidents/maintenance/notifications/settings/snapshots)
-- Public: status snapshot, status page payload (monitors + 30d uptime bars + incidents + maintenance), latency/uptime/outages endpoints
+- Public: status snapshot, status page payload (monitors + 60d uptime bars + incidents + maintenance), latency/uptime/outages endpoints
 - Admin: monitor CRUD + test, notification channel CRUD + test, incidents CRUD + updates + resolve, maintenance windows CRUD, analytics + CSV exports, settings
 - CI/CD: GitHub Actions (lint + typecheck + test + auto-deploy)
 
